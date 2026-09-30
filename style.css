@@ -183,3 +183,4 @@
 .mh_iconpick.mh_on { border-color: var(--SmartThemeQuoteColor, #e18a24); box-shadow: 0 0 0 1px var(--SmartThemeQuoteColor, #e18a24); }
 .mh_export { text-align: left; }
 .mh_import .mh_file_btn { margin: 0.2em 0 0.4em; }
+.mh_card .mh_trunc { font-size: 0.8em; color: #f5a524; white-space: nowrap; }

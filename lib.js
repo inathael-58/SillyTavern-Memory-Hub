@@ -203,3 +203,14 @@ export function cleanKeys(keys, names = []) {
     }
     return out;
 }
+
+/**
+ * Did the answer finish? A reply cut off by the token limit (common when a
+ * "thinking" model spends the budget on reasoning) lacks its closing tags.
+ */
+export function isComplete(raw, { memory = true, overview = false } = {}) {
+    const t = String(raw ?? '');
+    if (memory && /<memory>/i.test(t) && !/<\/memory>/i.test(t)) return false;
+    if (overview && !/<\/overview>/i.test(t)) return false;
+    return true;
+}
