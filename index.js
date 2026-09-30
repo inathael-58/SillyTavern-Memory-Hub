@@ -22,10 +22,11 @@
  */
 
 import { cleanKeys, cleanText, hasSegmenter, nextChunk, parseMany, parseSummary, rankMemories } from './lib.js';
+import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords, modulesFromTags } from './modules.js';
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.1.0'; // keep in sync with manifest.json
+const VERSION = '1.2.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -39,51 +40,6 @@ summary:
 - ...
 </memory>{{overview_format}}`;
 
-const PROMPT_SINGLE = `You are the memory keeper of an ongoing roleplay between {{user}} and {{char}}.
-Read NEW MESSAGES and write one compact memory of them.
-
-Rules:
-- Write in the same language the story is written in.
-- Keep what will matter later:
-  • events, decisions and their consequences; promises and plans
-  • how the relationship changed: feelings, trust, conflicts, milestones, boundaries
-  • what {{char}} learned about {{user}} (likes, habits, past, secrets) and the other way round
-  • nicknames, inside jokes, gifts, places that became meaningful
-  • injuries, items, time and place changes; unresolved threads
-- Skip flavour text, repeated description and status panels.
-- Always write names in full instead of "he/she": memories are read out of order.
-- Be concrete. No commentary, no guessing.
-- summary: short bullet points, at most {{memory_words}} words in total.
-- keys: 3-8 distinctive words someone would say when this memory becomes relevant again (places, objects, events, nicknames). Never use {{user}} or {{char}} alone as a key.
-{{overview_rule}}
-${FORMAT}`;
-
-const PROMPT_RPG = `You are the chronicler of an ongoing role-playing game / multi-character story with {{user}}.
-Read NEW MESSAGES and write one compact memory of them.
-
-Rules:
-- Write in the same language the story is written in.
-- Keep what will matter later:
-  • plot events and outcomes, decisions and their consequences
-  • every character involved: what they did and what changed (attitude towards {{user}}, relationships, secrets, injuries, status, whereabouts)
-  • quests and goals: started, advanced, completed, failed
-  • items, money, stats and abilities gained or lost; locations reached or unlocked
-  • factions, world facts and rules that were revealed
-  • open threads, promises, debts, enemies who got away
-- Always write names in full instead of "he/she": memories are read out of order.
-- Skip blow-by-blow combat, flavour text and status panels (keep only numbers that changed and matter).
-- summary: bullet points, at most {{memory_words}} words in total.
-- keys: 3-10 distinctive words (places, secondary characters, items, quest names, factions). Never use {{user}} alone as a key.
-{{overview_rule}}
-${FORMAT}`;
-
-const OVERVIEW_RULE_SINGLE = '- overview: rewrite PREVIOUS OVERVIEW so it also covers the new memory. It is the story so far in at most {{overview_words}} words: where the relationship stands, what happened that still matters, where they are now, open threads. Drop details that no longer matter.';
-const OVERVIEW_RULE_RPG = `- overview: rewrite PREVIOUS OVERVIEW as the CURRENT STATE of the game, at most {{overview_words}} words, under these headings:
-  Characters: one line each for the party and important characters (role, current state, relation to {{user}})
-  Now: where we are and what is happening
-  Quests & threads: active ones only
-  Key facts & items: what must not be forgotten
-  Drop what is resolved and no longer matters.`;
 const OVERVIEW_FORMAT = '\n<overview>\n<updated overview>\n</overview>';
 
 // v1.0.0 shipped one prompt; if a user edited it, keep theirs as "custom".
@@ -133,13 +89,6 @@ Answer in exactly this format and nothing else:
 ...
 </overview>`;
 
-const STYLE_LABEL = {
-    auto: ['อัตโนมัติ', 'แชทกลุ่มใช้แบบ RPG, แชทเดี่ยวใช้แบบคาร์เดียว'],
-    single: ['คาร์เดียว / ความสัมพันธ์', 'เน้นความรู้สึก ความสัมพันธ์ สิ่งที่รู้เกี่ยวกับกันและกัน'],
-    rpg: ['RPG / หลายตัวละคร', 'เน้นตัวละครแต่ละตัว เควส ไอเท็ม สถานที่ ฝ่าย เรื่องย่อเป็นสถานะเกมแบบมีหัวข้อ'],
-    custom: ['กำหนดเอง', 'เขียน prompt เอง'],
-};
-
 const DEFAULTS = Object.freeze({
     enabled: true,
     autoSummarize: true,
@@ -154,7 +103,11 @@ const DEFAULTS = Object.freeze({
     recallBudget: 800,      // tokens for recalled memories (overview not counted)
     queryDepth: 4,          // last N messages used to decide what to recall
     includeLatest: true,
-    style: 'auto',          // auto | single | rpg | custom
+    style: 'modules',       // modules | custom
+    defaultModules: null,   // module ids for bots without a choice; null = relationship (solo) / ensemble+story (group)
+    botModules: {},         // 'char:<avatar>' | 'group:<id>' -> module ids
+    customModules: [],      // user-made modules (same shape as BUILTIN_MODULES)
+    autoWords: true,        // add the modules' extra words to the lengths below
     sources: null,          // ordered list: 'main' or Connection Profile ids
     timeoutSec: 120,
     overviewPosition: 'prompt', // 'prompt' | 'chat'
@@ -162,7 +115,7 @@ const DEFAULTS = Object.freeze({
     recallPosition: 'chat',
     recallDepth: 2,
     maxMessageChars: 3000,  // per message, in the summarizer's input
-    prompt: PROMPT_SINGLE,  // used when style = custom
+    prompt: '',             // used when style = custom
     overviewTemplate: '[Story so far]\n{{overview}}',
     recallTemplate: '[Memories from earlier in the story that matter now]\n{{memories}}',
     notify: true,
@@ -191,8 +144,17 @@ function settings() {
     const s = ext[MODULE];
     // migrate 1.0.0
     if (s.sources == null) s.sources = s.source === 'profile' && s.profileId ? [s.profileId, 'main'] : ['main'];
-    if (s.style == null && s.prompt != null) s.style = s.prompt.trim() === PROMPT_V1.trim() ? 'auto' : 'custom';
-    if (s.prompt != null && s.prompt.trim() === PROMPT_V1.trim()) s.prompt = PROMPT_SINGLE;
+    if (s.style == null && s.prompt != null) s.style = s.prompt.trim() === PROMPT_V1.trim() ? 'modules' : 'custom';
+    if (s.prompt != null && s.prompt.trim() === PROMPT_V1.trim()) s.prompt = '';
+    // migrate 1.1.0 styles to modules (1.1 raised the lengths for RPG by hand; modules now add them)
+    if (s.style === 'single') { s.style = 'modules'; s.defaultModules = ['relationship']; }
+    if (s.style === 'rpg') {
+        s.style = 'modules'; s.defaultModules = ['ensemble', 'rpg'];
+        if (s.memoryWords === 180) s.memoryWords = 120;
+        if (s.overviewWords === 400) s.overviewWords = 250;
+        if (s.responseLength === 1200) s.responseLength = 800;
+    }
+    if (s.style === 'auto') s.style = 'modules';
     for (const [k, v] of Object.entries(DEFAULTS)) if (s[k] === undefined || (k === 'sources' && s[k] == null)) s[k] = v ?? ['main'];
     if (!Array.isArray(s.sources) || !s.sources.length) s.sources = ['main'];
     return s;
@@ -245,10 +207,53 @@ function latestOf(pool) {
     return [...pool].reverse().find(m => m.source === 'carry') ?? null;
 }
 
-function effectiveStyle() {
+// ---------------------------------------------------------------- prompt modules
+
+/** Identity of the bot the open chat belongs to (per character, or per group). */
+function botKey() {
+    const c = ctx();
+    if (c.groupId) return `group:${c.groupId}`;
+    const ch = c.characters?.[c.characterId];
+    return ch ? `char:${ch.avatar}` : null;
+}
+function botName() {
+    const c = ctx();
+    if (c.groupId) return c.groups?.find(g => g.id === c.groupId)?.name ?? 'กลุ่ม';
+    return c.characters?.[c.characterId]?.name ?? '';
+}
+function botTagNames() {
+    const c = ctx();
+    const key = c.groupId ?? c.characters?.[c.characterId]?.avatar;
+    const ids = key ? (c.tagMap?.[key] ?? []) : [];
+    return ids.map(id => c.tags?.find(t => t.id === id)?.name).filter(Boolean);
+}
+const moduleList = () => allModules(settings().customModules);
+
+/** @returns {{ids:string[], from:'bot'|'tags'|'default', tags?:string[]}} */
+function resolveModules() {
     const s = settings();
-    if (s.style === 'single' || s.style === 'rpg') return s.style;
-    return isGroup() ? 'rpg' : 'single';
+    const known = new Set(moduleList().map(m => m.id));
+    const key = botKey();
+    const own = key ? s.botModules?.[key] : null;
+    if (Array.isArray(own)) return { ids: own.filter(id => known.has(id)), from: 'bot' };
+    const tags = botTagNames();
+    const byTag = modulesFromTags(tags, moduleList());
+    if (byTag.length) return { ids: byTag, from: 'tags', tags };
+    const def = Array.isArray(s.defaultModules) ? s.defaultModules : (isGroup() ? ['ensemble', 'story'] : ['relationship']);
+    return { ids: def.filter(id => known.has(id)), from: 'default' };
+}
+function activeModules() {
+    const ids = new Set(resolveModules().ids);
+    return moduleList().filter(m => ids.has(m.id));
+}
+function wordBudget() {
+    const s = settings();
+    const extra = s.autoWords ? extraWords(activeModules()) : { memory: 0, overview: 0 };
+    const memory = s.memoryWords + extra.memory;
+    const overview = s.overviewWords + extra.overview;
+    // Thai runs 2-3 tokens a word; leave room so the answer is never cut off
+    const response = Math.max(s.responseLength, Math.ceil((memory + (s.overviewEnabled ? overview : 0)) * 3 + 150));
+    return { memory, overview, response };
 }
 
 // ---------------------------------------------------------------- model calls (with fallback chain)
@@ -340,20 +345,19 @@ function transcript(start, end) {
 }
 
 function fill(template, withOverview) {
-    const s = settings();
-    const rule = effectiveStyle() === 'rpg' ? OVERVIEW_RULE_RPG : OVERVIEW_RULE_SINGLE;
+    const w = wordBudget();
     const p = String(template)
-        .replaceAll('{{overview_rule}}', withOverview ? rule : '')
+        .replaceAll('{{overview_rule}}', withOverview ? buildOverviewRule(activeModules()) : '')
         .replaceAll('{{overview_format}}', withOverview ? OVERVIEW_FORMAT : '')
-        .replaceAll('{{overview_words}}', String(s.overviewWords))
-        .replaceAll('{{memory_words}}', String(s.memoryWords));
+        .replaceAll('{{overview_words}}', String(w.overview))
+        .replaceAll('{{memory_words}}', String(w.memory));
     return ctx().substituteParams(p);
 }
 
 function summaryTemplate() {
     const s = settings();
     if (s.style === 'custom' && String(s.prompt ?? '').trim()) return s.prompt;
-    return effectiveStyle() === 'rpg' ? PROMPT_RPG : PROMPT_SINGLE;
+    return buildPrompt(activeModules(), { group: isGroup() });
 }
 
 /** Summarizes chat[start..end] into one memory (and refreshes the overview). */
@@ -373,7 +377,7 @@ async function summarizeRange(start, end, { replaceId = null, updateOverview = t
     if (prev) parts.push(`PREVIOUS MEMORY (for continuity, do not repeat it):\n${memoryBlock(prev)}`);
     parts.push(`NEW MESSAGES (#${start}–#${end}):\n${body}`);
 
-    const raw = await callModel(fill(summaryTemplate(), withOverview), ctx().substituteParams(parts.join('\n\n')), s.responseLength,
+    const raw = await callModel(fill(summaryTemplate(), withOverview), ctx().substituteParams(parts.join("\n\n")), wordBudget().response,
         out => !!parseSummary(out).text);
     if (ctx().chatId !== chatId) throw new Error('เปลี่ยนแชทระหว่างสรุป ผลลัพธ์ถูกทิ้ง');
 
@@ -768,7 +772,7 @@ async function optimizeImported({ onlyLong = true } = {}) {
     const s = settings();
     const st = state();
     if (!st) return;
-    const limit = s.memoryWords * 3; // tokens; Thai runs ~2-3 tokens per word
+    const limit = wordBudget().memory * 3; // tokens; Thai runs ~2-3 tokens per word
     const targets = [];
     for (const m of st.memories.filter(x => x.source === 'import' && !x.optimized)) {
         if (!onlyLong || await countTokens(m.text) > limit) targets.push(m);
@@ -845,7 +849,7 @@ async function rebuildOverview() {
                 if (progress) globalThis.toastr?.clear(progress);
                 progress = toast.info(`สร้างเรื่องย่อใหม่ ${bi + 1}/${batches.length}…`, { timeOut: 0, extendedTimeOut: 0 });
                 const user = `PREVIOUS OVERVIEW:\n${overview || '(none yet)'}\n\nMEMORIES:\n${batch.map(memoryBlock).join('\n')}`;
-                const raw = await callModel(fill(PROMPT_REBUILD, true), ctx().substituteParams(user), s.responseLength, out => !!parseSummary(out).overview);
+                const raw = await callModel(fill(PROMPT_REBUILD, true), ctx().substituteParams(user), wordBudget().response, out => !!parseSummary(out).overview);
                 overview = parseSummary(raw).overview || overview;
             }
             const now = state();
@@ -895,12 +899,25 @@ function renderSettings() {
           <label class="checkbox_label"><input type="checkbox" id="mh_latest"> ใส่ความจำก้อนล่าสุดเสมอ (ต่อเนื่องกับข้อความดิบ)</label>
           <label class="checkbox_label"><input type="checkbox" id="mh_notify"> แจ้งเตือนเมื่อสร้างความจำใหม่</label>
 
-          <h4>สไตล์การสรุป</h4>
+          <h4>Prompt สรุป</h4>
           <label class="mh_row"><span>แบบ</span>
             <select id="mh_style" class="text_pole">
-              ${Object.entries(STYLE_LABEL).map(([k, [l]]) => `<option value="${k}">${l}</option>`).join('')}
+              <option value="modules">ประกอบจากโมดูลตามบอท (แนะนำ)</option>
+              <option value="custom">เขียนเองทั้งหมด</option>
             </select></label>
-          <small id="mh_style_hint" class="mh_hint"></small>
+          <div id="mh_modbox" class="mh_modbox">
+            <div class="mh_modhead"><b>โมดูลของบอทนี้:</b> <span id="mh_botname"></span></div>
+            <small id="mh_modsrc" class="mh_hint"></small>
+            <div id="mh_mods" class="mh_mods"></div>
+            <div class="mh_btns">
+              <div class="menu_button" id="mh_mod_reset" title="เลิกใช้ที่เลือกเองของบอทนี้ กลับไปใช้แท็กหรือค่าเริ่มต้น"><i class="fa-solid fa-rotate-left"></i> กลับไปใช้แท็ก/ค่าเริ่มต้น</div>
+              <div class="menu_button" id="mh_mod_setdef" title="บอทที่ยังไม่ได้เลือกและไม่มีแท็กที่ตรง จะใช้ชุดนี้"><i class="fa-solid fa-star"></i> ตั้งชุดนี้เป็นค่าเริ่มต้น</div>
+              <div class="menu_button" id="mh_mod_preview"><i class="fa-solid fa-eye"></i> ดู prompt ที่ประกอบแล้ว</div>
+              <div class="menu_button" id="mh_mod_manage"><i class="fa-solid fa-puzzle-piece"></i> จัดการโมดูล / สร้างเอง</div>
+            </div>
+            <label class="checkbox_label"><input type="checkbox" id="mh_autowords"> ขยายความยาวความจำและเรื่องย่อตามโมดูลอัตโนมัติ</label>
+            <small id="mh_words_now" class="mh_hint"></small>
+          </div>
 
           <h4>จังหวะการสรุป</h4>
           ${numberRow('mh_chunk', 'สรุปทีละ (ข้อความ)', 'ทุก ๆ กี่ข้อความถึงจะสรุปหนึ่งครั้ง ยิ่งมากยิ่งเรียก API น้อย', 4, 200)}
@@ -935,11 +952,10 @@ function renderSettings() {
               <label>แม่แบบความจำที่ดึง <small>(ใช้ {{memories}})</small></label>
               <textarea id="mh_rectpl" class="text_pole" rows="2"></textarea>
               <div id="mh_prompt_box">
-                <label>Prompt ที่ใช้สรุป (สไตล์ "กำหนดเอง")</label>
+                <label>Prompt ที่ใช้สรุป (แบบ "เขียนเองทั้งหมด" — ใช้กับทุกบอท)</label>
                 <textarea id="mh_prompt" class="text_pole" rows="12"></textarea>
                 <div class="mh_btns">
-                  <div class="menu_button" id="mh_prompt_single">เริ่มจากแบบคาร์เดียว</div>
-                  <div class="menu_button" id="mh_prompt_rpg">เริ่มจากแบบ RPG</div>
+                  <div class="menu_button" id="mh_prompt_from_mods">เริ่มใหม่จากโมดูลของบอทนี้</div>
                 </div>
                 <small class="mh_hint">ใช้ได้: {{memory_words}} {{overview_words}} {{overview_rule}} {{overview_format}} {{char}} {{user}} — ต้องคงรูปแบบคำตอบ &lt;memory&gt; ไว้</small>
               </div>
@@ -981,18 +997,26 @@ function renderSettings() {
     bindVal('#mh_prompt', 'prompt');
 
     $('#mh_style').val(s.style).on('change', function () {
-        const prev = s.style;
         s.style = this.value;
-        // RPG needs room for more characters and threads
-        if (this.value === 'rpg' && prev !== 'rpg') {
-            if (s.memoryWords === 120) { s.memoryWords = 180; $('#mh_memwords').val(180); }
-            if (s.overviewWords === 250) { s.overviewWords = 400; $('#mh_ovwords').val(400); }
-            if (s.responseLength < 1200) { s.responseLength = 1200; $('#mh_resp').val(1200); }
-        }
+        // start the custom prompt from what this bot uses now
+        if (s.style === 'custom' && !String(s.prompt ?? '').trim()) { s.prompt = buildPrompt(activeModules(), { group: isGroup() }); $('#mh_prompt').val(s.prompt); }
         saveSettings(); refreshUi();
     });
-    $('#mh_prompt_single').on('click', () => { s.prompt = PROMPT_SINGLE; $('#mh_prompt').val(s.prompt); saveSettings(); });
-    $('#mh_prompt_rpg').on('click', () => { s.prompt = PROMPT_RPG; $('#mh_prompt').val(s.prompt); saveSettings(); });
+    $('#mh_prompt_from_mods').on('click', () => { s.prompt = buildPrompt(activeModules(), { group: isGroup() }); $('#mh_prompt').val(s.prompt); saveSettings(); });
+    bindCheck('#mh_autowords', 'autoWords');
+    $('#mh_mods').on('change', 'input[type=checkbox]', function () {
+        const key = botKey();
+        if (!key) return toast.warn('เปิดแชทก่อน');
+        const ids = new Set(resolveModules().ids);
+        if (this.checked) ids.add(this.value); else ids.delete(this.value);
+        // keep the list in module order
+        s.botModules[key] = moduleList().map(m => m.id).filter(id => ids.has(id));
+        saveSettings(); refreshUi();
+    });
+    $('#mh_mod_reset').on('click', () => { const key = botKey(); if (key) delete s.botModules[key]; saveSettings(); refreshUi(); });
+    $('#mh_mod_setdef').on('click', () => { s.defaultModules = [...resolveModules().ids]; saveSettings(); refreshUi(); toast.ok('ตั้งเป็นค่าเริ่มต้นแล้ว'); });
+    $('#mh_mod_preview').on('click', previewPrompt);
+    $('#mh_mod_manage').on('click', manageModules);
 
     $('#mh_src_add').on('click', () => {
         const used = new Set(s.sources);
@@ -1040,14 +1064,121 @@ function renderSourcesOptionsOnly() {
     if (sel.options.length !== profiles().length + 1 + (val !== 'main' && !profiles().some(p => p.id === val) ? 1 : 0)) sel.innerHTML = sourceOptions(val);
 }
 
+function renderModulePicker() {
+    const s = settings();
+    $('#mh_modbox').toggle(s.style !== 'custom');
+    const key = botKey();
+    $('#mh_botname').text(key ? botName() : '(ยังไม่ได้เปิดแชท)');
+    const r = resolveModules();
+    const src = r.from === 'bot' ? 'เลือกเองสำหรับบอทนี้'
+        : r.from === 'tags' ? `จากแท็กของบอท: ${r.tags.join(', ')} — ติ๊กเพื่อปรับเฉพาะบอทนี้`
+            : `ค่าเริ่มต้น${Array.isArray(s.defaultModules) ? '' : (isGroup() ? ' (แชทกลุ่ม)' : ' (แชทเดี่ยว)')} — ติ๊กเพื่อปรับเฉพาะบอทนี้ หรือใส่แท็กให้บอทใน SillyTavern`;
+    $('#mh_modsrc').text(src);
+    const on = new Set(r.ids);
+    $('#mh_mods').html(moduleList().map(m => `
+      <label class="mh_mod${on.has(m.id) ? ' mh_on' : ''}" title="${esc(m.desc ?? '')}${m.tags?.length ? `\nแท็กที่เปิดโมดูลนี้: ${esc(m.tags.join(', '))}` : ''}">
+        <input type="checkbox" value="${esc(m.id)}"${on.has(m.id) ? ' checked' : ''}${key ? '' : ' disabled'}>
+        <span>${esc(m.name)}${m.custom ? ' <i class="fa-solid fa-pen-nib" title="โมดูลของเรา"></i>' : ''}</span>
+      </label>`).join(''));
+    $('#mh_mod_reset').toggleClass('disabled', r.from !== 'bot');
+    const w = wordBudget();
+    $('#mh_words_now').text(`บอทนี้: ความจำ ≤ ${w.memory} คำ · เรื่องย่อ ≤ ${w.overview} คำ · response ${w.response} โทเคน`);
+}
+
+async function previewPrompt() {
+    const s = settings();
+    const { Popup, POPUP_TYPE } = ctx();
+    const r = resolveModules();
+    const names = activeModules().map(m => m.name).join(', ') || '(ไม่มี — ใช้แค่พื้นฐาน)';
+    const text = fill(summaryTemplate(), s.overviewEnabled);
+    const html = `<div class="mh_preview">
+      <h3>Prompt สรุปของ ${esc(botName() || 'บอทนี้')}</h3>
+      <p>${s.style === 'custom' ? 'แบบเขียนเองทั้งหมด' : `โมดูล: <b>${esc(names)}</b> (${r.from === 'bot' ? 'เลือกเอง' : r.from === 'tags' ? 'จากแท็ก' : 'ค่าเริ่มต้น'})`} · ${await countTokens(text)} โทเคน</p>
+      <pre>${esc(text)}</pre></div>`;
+    await new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true }).show();
+}
+
+const linesOf = v => String(v ?? '').split('\n').map(x => x.replace(/^\s*[-•*]\s*/, '').trim()).filter(Boolean);
+
+async function manageModules() {
+    const s = settings();
+    const { Popup, POPUP_TYPE } = ctx();
+    const root = document.createElement('div');
+    root.className = 'mh_modmgr';
+    const draw = () => {
+        const customIds = new Set(s.customModules.map(m => m.id));
+        root.innerHTML = `
+          <h3><i class="fa-solid fa-puzzle-piece"></i> โมดูล prompt สรุป</h3>
+          <p class="mh_hint">แต่ละโมดูลเพิ่มสิ่งที่ต้องจำเข้าไปใน prompt สรุป บอทจะได้โมดูลจาก (1) ที่เลือกเองในแผงตั้งค่า (2) แท็กของบอทใน SillyTavern ที่ตรงกับ "แท็ก" ของโมดูล (3) ค่าเริ่มต้น
+          เขียนสิ่งที่ต้องจำเป็นภาษาอังกฤษจะได้ผลเสถียรที่สุด แต่ภาษาไทยก็ใช้ได้</p>
+          <div class="mh_btns"><div class="menu_button mh_mod_new"><i class="fa-solid fa-plus"></i> สร้างโมดูลใหม่</div></div>
+          ${s.customModules.map(m => moduleEditor(m, true)).join('')}
+          <h4>โมดูลในตัว</h4>
+          ${BUILTIN_MODULES.filter(m => !customIds.has(m.id)).map(m => moduleEditor(m, false)).join('')}`;
+    };
+    draw();
+    const findCustom = el => s.customModules.find(m => m.id === el.closest('.mh_modcard')?.dataset.id);
+    root.addEventListener('input', e => {
+        const t = e.target;
+        const m = findCustom(t);
+        if (!m || !t.dataset.f) return;
+        const f = t.dataset.f;
+        if (f === 'keep' || f === 'skip') m[f] = linesOf(t.value);
+        else if (f === 'tags') m.tags = t.value.split(/[,，]/).map(x => x.trim()).filter(Boolean);
+        else if (f === 'words' || f === 'overviewWords') m[f] = clampInt(t.value, 0, 1000, 0);
+        else m[f] = t.value;
+        saveSettings();
+    });
+    root.addEventListener('click', e => {
+        const t = e.target;
+        if (!(t instanceof Element)) return;
+        if (t.closest('.mh_mod_new')) {
+            s.customModules.unshift({ id: `c_${uid()}`, name: 'โมดูลใหม่', desc: '', tags: [], keep: [], skip: [], keys: '', overview: '', words: 20, overviewWords: 40 });
+            saveSettings(); draw(); refreshUi();
+        } else if (t.closest('.mh_mod_copy')) {
+            const id = t.closest('.mh_modcard').dataset.id;
+            const b = moduleList().find(m => m.id === id);
+            if (b) { s.customModules.unshift({ ...structuredClone(b), custom: undefined }); saveSettings(); draw(); refreshUi(); }
+        } else if (t.closest('.mh_mod_del')) {
+            const id = t.closest('.mh_modcard').dataset.id;
+            s.customModules = s.customModules.filter(m => m.id !== id);
+            saveSettings(); draw(); refreshUi();
+        }
+    });
+    await new Popup(root, POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: 'ปิด' }).show();
+    refreshUi();
+}
+
+function moduleEditor(m, editable) {
+    const ro = editable ? '' : ' readonly';
+    const builtinOverride = editable && !m.id.startsWith('c_');
+    return `<div class="mh_modcard${editable ? ' mh_editable' : ''}" data-id="${esc(m.id)}">
+      <div class="mh_card_head">
+        <input class="text_pole mh_title" data-f="name" value="${esc(m.name)}"${ro}>
+        ${editable
+            ? `<i class="fa-solid fa-trash mh_icon mh_mod_del" title="${builtinOverride ? 'ลบฉบับที่แก้ แล้วกลับไปใช้ของในตัว' : 'ลบโมดูล'}"></i>`
+            : '<div class="menu_button mh_mod_copy" title="ทำสำเนามาแก้ ฉบับของเราจะใช้แทนของในตัว">แก้ไข</div>'}
+      </div>
+      ${builtinOverride ? '<small class="mh_hint">ฉบับแก้ของโมดูลในตัว (ลบเพื่อกลับไปใช้ของเดิม)</small>' : ''}
+      <label>คำอธิบาย</label><input class="text_pole" data-f="desc" value="${esc(m.desc ?? '')}"${ro}>
+      <label>แท็กที่เปิดโมดูลนี้ (คั่นด้วย ,)</label><input class="text_pole" data-f="tags" value="${esc((m.tags ?? []).join(', '))}"${ro}>
+      <label>สิ่งที่ต้องจำ (บรรทัดละข้อ)</label><textarea class="text_pole" data-f="keep" rows="3"${ro}>${esc((m.keep ?? []).join('\n'))}</textarea>
+      <label>สิ่งที่ไม่ต้องจำ (บรรทัดละข้อ)</label><textarea class="text_pole" data-f="skip" rows="1"${ro}>${esc((m.skip ?? []).join('\n'))}</textarea>
+      <label>คำแบบไหนควรเป็นคีย์</label><input class="text_pole" data-f="keys" value="${esc(m.keys ?? '')}"${ro}>
+      <label>หัวข้อในเรื่องย่อ (เว้นว่างได้) เช่น <code>Clues: what is known and by whom</code></label><input class="text_pole" data-f="overview" value="${esc(m.overview ?? '')}"${ro}>
+      <div class="mh_row"><span>คำเพิ่มต่อความจำ / เรื่องย่อ</span>
+        <input type="number" class="text_pole" data-f="words" value="${Number(m.words) || 0}"${ro}>
+        <input type="number" class="text_pole" data-f="overviewWords" value="${Number(m.overviewWords) || 0}"${ro}></div>
+    </div>`;
+}
+
 function refreshUi() {
     const s = settings();
     const st = state();
     $('#mh_ovdepth').closest('.mh_row').toggle(s.overviewPosition === 'chat');
     $('#mh_recdepth').closest('.mh_row').toggle(s.recallPosition === 'chat');
     $('#mh_prompt_box').toggle(s.style === 'custom');
-    const effective = effectiveStyle();
-    $('#mh_style_hint').text(`${STYLE_LABEL[s.style]?.[1] ?? ''}${s.style === 'auto' ? ` — ตอนนี้ใช้: ${STYLE_LABEL[effective][0]}` : ''}`);
+    renderModulePicker();
 
     let status;
     if (!st) status = 'ยังไม่ได้เปิดแชท';
