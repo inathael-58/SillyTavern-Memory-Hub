@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.3.0'; // keep in sync with manifest.json
+const VERSION = '1.4.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -122,7 +122,36 @@ const DEFAULTS = Object.freeze({
     carrySummarizeRest: true,
     topbar: true,           // button + panel in the chat top bar (Top Info Bar extension)
     topbarFallback: true,   // our own slim bar when Top Info Bar is not installed
+    icon: 'svg:heart',      // see ICONS
 });
+
+// ---------------------------------------------------------------- icons
+
+const SVG_ICONS = {
+    heart: ['ที่คั่นหนังสือหัวใจ', `<svg class="mh_svg" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.2 2h11.6c.7 0 1.2.5 1.2 1.2v17.9c0 .5-.6.8-1 .5L12 17.4l-6 4.2c-.4.3-1-.0-1-.5V3.2C5 2.5 5.5 2 6.2 2z"/><path fill="var(--mh-accent, #ff8fab)" d="M12 13.2l-.55-.5C9.5 10.95 8.2 9.8 8.2 8.4c0-1.15.9-2.05 2.05-2.05.65 0 1.27.3 1.67.78.4-.48 1.02-.78 1.67-.78 1.15 0 2.05.9 2.05 2.05 0 1.4-1.3 2.55-3.25 4.3z"/></svg>`],
+    star: ['ที่คั่นหนังสือดาว', `<svg class="mh_svg" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.2 2h11.6c.7 0 1.2.5 1.2 1.2v17.9c0 .5-.6.8-1 .5L12 17.4l-6 4.2c-.4.3-1-.0-1-.5V3.2C5 2.5 5.5 2 6.2 2z"/><path fill="var(--mh-accent-star, #ffd166)" d="M12 5.6l1.25 2.55 2.8.4-2.03 1.98.48 2.8L12 12l-2.5 1.33.48-2.8-2.03-1.98 2.8-.4z"/></svg>`],
+    moon: ['ที่คั่นหนังสือจันทร์', `<svg class="mh_svg" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.2 2h11.6c.7 0 1.2.5 1.2 1.2v17.9c0 .5-.6.8-1 .5L12 17.4l-6 4.2c-.4.3-1-.0-1-.5V3.2C5 2.5 5.5 2 6.2 2z"/><path fill="var(--mh-accent-moon, #cdb4ff)" d="M13.6 5.8a3.9 3.9 0 1 0 1.9 6.3 3.2 3.2 0 0 1-1.9-6.3z"/></svg>`],
+};
+const ICONS = [
+    'svg:heart', 'svg:star', 'svg:moon',
+    'fa-solid fa-bookmark', 'fa-solid fa-book-bookmark', 'fa-solid fa-book-open', 'fa-solid fa-feather', 'fa-solid fa-scroll', 'fa-solid fa-brain',
+    '🔖', '📖', '🌙', '✨', '🌸', '🍀',
+];
+
+/** Inner HTML for an icon choice (Font Awesome class, built-in SVG, or an emoji). */
+function iconHtml(spec) {
+    if (String(spec).startsWith('svg:')) return (SVG_ICONS[spec.slice(4)] ?? SVG_ICONS.heart)[1];
+    if (String(spec).startsWith('fa-')) return `<i class="${esc(spec)}"></i>`;
+    return `<span class="mh_emoji">${esc(spec)}</span>`;
+}
+/** Draws the chosen icon into every slot (settings, manager, top bar) and marks it in the picker. */
+function applyIcon(scope = document) {
+    const spec = settings().icon;
+    const html = iconHtml(spec);
+    for (const el of scope.querySelectorAll('.mh_icon_slot')) if (el.dataset.icon !== spec) { el.innerHTML = html; el.dataset.icon = spec; }
+    for (const el of scope.querySelectorAll('.mh_iconpick')) el.classList.toggle('mh_on', el.dataset.icon === spec);
+}
+const iconLabel = spec => String(spec).startsWith('svg:') ? (SVG_ICONS[spec.slice(4)]?.[0] ?? spec) : spec;
 
 // ---------------------------------------------------------------- helpers
 
@@ -755,11 +784,16 @@ async function readChatState(id) {
 async function importFromChat(id) {
     const other = await readChatState(id);
     if (!other?.memories?.length && !other?.overview) return toast.warn('แชทนั้นไม่มีความจำของ Memory Hub');
+    mergeForeign(other, id);
+}
+
+/** Adds another chat's (or an export file's) memories before this chat's own ones. */
+function mergeForeign(other, id) {
     const st = state();
     const seen = new Set(st.memories.map(m => m.text));
     let n = 0;
-    const incoming = other.memories.filter(m => !seen.has(m.text)).map(m => {
-        const { overviewAfter: _drop, ...rest } = m;
+    const incoming = (other.memories ?? []).filter(m => m?.text && !seen.has(m.text)).map(m => {
+        const { overviewAfter: _drop, stats: _stats, sourceMessages: _src, ...rest } = m;
         n++;
         return { ...rest, id: uid(), source: m.source === 'auto' ? 'carry' : m.source, origin: m.origin ?? (m.end >= 0 ? { chat: id, start: m.start, end: m.end } : undefined), start: -1, end: -1 };
     });
@@ -908,6 +942,140 @@ async function rebuildOverview() {
     refreshUi();
 }
 
+// ---------------------------------------------------------------- export
+
+function download(name, text, type) {
+    const blob = new Blob([text], { type });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+const fileSafe = s => String(s ?? '').replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 80) || 'chat';
+
+/**
+ * Everything needed to judge the summary prompt: the memories with how many
+ * tokens of chat each one replaced, the prompt and settings that made them,
+ * and (optionally) the original messages next to each memory.
+ */
+async function buildExport({ withSource = false } = {}) {
+    const c = ctx();
+    const s = settings();
+    const st = state();
+    const r = resolveModules();
+    const w = wordBudget();
+    const memories = [];
+    let srcTotal = 0;
+    let memTotal = 0;
+    for (const m of st.memories) {
+        const memTokens = await countTokens(memoryBlock(m));
+        let srcTokens = null;
+        let sourceMessages;
+        if (m.source === 'auto' && m.end >= 0) {
+            const msgs = c.chat.slice(m.start, m.end + 1).filter(x => x && !x.is_system);
+            srcTokens = await countTokens(msgs.map(x => cleanText(x.mes, s.maxMessageChars)).join('\n'));
+            srcTotal += srcTokens;
+            memTotal += memTokens;
+            if (withSource) sourceMessages = msgs.map(x => ({ name: x.name, is_user: !!x.is_user, mes: cleanText(x.mes, s.maxMessageChars) }));
+        }
+        const { overviewAfter: _o, ...rest } = m;
+        memories.push({ ...rest, stats: { memTokens, srcTokens, ratio: srcTokens ? +(memTokens / srcTokens).toFixed(3) : null }, ...(sourceMessages ? { sourceMessages } : {}) });
+    }
+    return {
+        format: 'memory-hub-export',
+        version: VERSION,
+        exportedAt: new Date().toISOString(),
+        chat: c.getCurrentChatId(),
+        bot: botName(),
+        messages: c.chat.length,
+        summarizedUpTo: st.lastEnd,
+        chain: st.chain ?? [],
+        prompt: {
+            style: s.style,
+            modules: activeModules().map(m => ({ id: m.id, name: m.name })),
+            modulesFrom: r.from,
+            memoryWords: w.memory,
+            overviewWords: w.overview,
+            responseLength: w.response,
+            chunkSize: s.chunkSize,
+            keepRaw: s.keepRaw,
+            text: fill(summaryTemplate(), s.overviewEnabled),
+        },
+        recall: { topK: s.topK, budget: s.recallBudget, queryDepth: s.queryDepth, lastInjection },
+        stats: {
+            memories: st.memories.length,
+            summarizedSourceTokens: srcTotal,
+            summarizedMemoryTokens: memTotal,
+            compression: srcTotal ? +(memTotal / srcTotal).toFixed(3) : null,
+            overviewTokens: await countTokens(st.overview),
+        },
+        overview: st.overview,
+        memories,
+    };
+}
+
+function exportMarkdown(x) {
+    const pct = v => (v == null ? '—' : `${Math.round(v * 100)}%`);
+    const lines = [
+        `# Memory Hub — ${x.bot}`,
+        '',
+        `- แชท: ${x.chat}`,
+        `- ส่งออกเมื่อ: ${new Date(x.exportedAt).toLocaleString()} · Memory Hub v${x.version}`,
+        `- ข้อความทั้งหมด ${x.messages} · สรุปแล้วถึง #${x.summarizedUpTo} · ความจำ ${x.stats.memories} ก้อน`,
+        `- prompt: ${x.prompt.style === 'custom' ? 'เขียนเองทั้งหมด' : `โมดูล ${x.prompt.modules.map(m => m.name).join(', ') || '(พื้นฐาน)'} (${{ bot: 'เลือกเอง', tags: 'จากแท็ก', default: 'ค่าเริ่มต้น' }[x.prompt.modulesFrom] ?? x.prompt.modulesFrom})`} · ความจำ ≤ ${x.prompt.memoryWords} คำ · เรื่องย่อ ≤ ${x.prompt.overviewWords} คำ · สรุปทีละ ${x.prompt.chunkSize} ข้อความ`,
+        `- ย่อข้อความ ${x.stats.summarizedSourceTokens} โทเคน เหลือ ${x.stats.summarizedMemoryTokens} โทเคน (${pct(x.stats.compression)}) · เรื่องย่อ ${x.stats.overviewTokens} โทเคน`,
+        '',
+        '## เรื่องย่อจนถึงตอนนี้',
+        '',
+        x.overview || '_(ยังไม่มี)_',
+        '',
+        `## ความจำ (${x.memories.length})`,
+        '',
+    ];
+    x.memories.forEach((m, i) => {
+        const where = m.end >= 0 ? `#${m.start}–#${m.end}` : m.source === 'carry' ? 'จากแชทก่อน' : m.source === 'import' ? 'นำเข้า' : 'เพิ่มเอง';
+        const st = m.stats.srcTokens ? ` · ต้นฉบับ ${m.stats.srcTokens} → ${m.stats.memTokens} โทเคน (${pct(m.stats.ratio)})` : ` · ${m.stats.memTokens} โทเคน`;
+        lines.push(`### ${i + 1}. ${m.title || '(ไม่มีชื่อ)'}${m.pinned ? ' 📌' : ''}`, '', `_${where}${st}_  `, `คีย์: ${(m.keys ?? []).join(', ') || '—'}`, '', String(m.text ?? '').trim(), '');
+        if (m.sourceMessages?.length) {
+            lines.push('<details><summary>ข้อความต้นฉบับ</summary>', '');
+            for (const s of m.sourceMessages) lines.push(`> **${s.name}:** ${s.mes.replace(/\n+/g, ' ')}`, '>');
+            lines.push('', '</details>', '');
+        }
+    });
+    lines.push('## Prompt สรุปที่ใช้อยู่ตอนนี้', '', '```', x.prompt.text, '```', '');
+    return lines.join('\n');
+}
+
+async function exportDialog() {
+    if (!state()) return toast.warn('เปิดแชทก่อน');
+    const c = ctx();
+    const box = document.createElement('div');
+    box.className = 'mh_export';
+    box.innerHTML = `
+      <h3>ส่งออกคลังความจำ</h3>
+      <p>ได้ทั้งความจำ เรื่องย่อ prompt สรุปที่ใช้ และสถิติว่าแต่ละก้อนย่อข้อความจากกี่โทเคนเหลือกี่โทเคน ใช้เช็กว่า prompt ทำงานดีแค่ไหน</p>
+      <label class="checkbox_label"><input type="checkbox" class="mh_ex_src"> แนบข้อความต้นฉบับไว้ใต้ความจำแต่ละก้อน (ไฟล์ใหญ่ขึ้น แต่เทียบได้ว่าสรุปตกหล่นอะไร)</label>
+      <div class="mh_btns">
+        <div class="menu_button mh_ex_md"><i class="fa-brands fa-markdown"></i> Markdown (อ่านง่าย)</div>
+        <div class="menu_button mh_ex_json"><i class="fa-solid fa-file-code"></i> JSON (นำเข้ากลับได้)</div>
+      </div>`;
+    box.addEventListener('click', async e => {
+        const t = e.target;
+        if (!(t instanceof Element)) return;
+        const md = t.closest('.mh_ex_md');
+        const js = t.closest('.mh_ex_json');
+        if (!md && !js) return;
+        const x = await buildExport({ withSource: box.querySelector('.mh_ex_src').checked });
+        const base = `memory-hub - ${fileSafe(x.chat)}`;
+        if (md) download(`${base}.md`, exportMarkdown(x), 'text/markdown;charset=utf-8');
+        else download(`${base}.json`, JSON.stringify(x, null, 2), 'application/json');
+        toast.ok('ส่งออกแล้ว');
+    });
+    await new c.Popup(box, c.POPUP_TYPE.TEXT, '', { okButton: 'ปิด' }).show();
+}
+
 // ---------------------------------------------------------------- settings panel
 
 function numberRow(id, label, hint, min, max) {
@@ -925,7 +1093,7 @@ function renderSettings() {
         <div class="inline-drawer-content">
           <div id="mh_status" class="mh_status"></div>
           <div class="mh_btns">
-            <div class="menu_button" id="mh_open"><i class="fa-solid fa-brain"></i> เปิดคลังความจำ</div>
+            <div class="menu_button" id="mh_open"><span class="mh_icon_slot"></span> เปิดคลังความจำ</div>
             <div class="menu_button" id="mh_now"><i class="fa-solid fa-wand-magic-sparkles"></i> สรุปตอนนี้</div>
             <div class="menu_button" id="mh_last"><i class="fa-solid fa-eye"></i> ดูสิ่งที่ส่งล่าสุด</div>
             <div class="menu_button" id="mh_carry"><i class="fa-solid fa-forward"></i> เริ่มแชทใหม่ต่อเรื่อง</div>
@@ -940,6 +1108,7 @@ function renderSettings() {
           <label class="checkbox_label"><input type="checkbox" id="mh_notify"> แจ้งเตือนเมื่อสร้างความจำใหม่</label>
           <label class="checkbox_label" title="ปุ่มสมองบนแถบด้านบนของแชท: ดูคิวที่กำลังสรุป สรุปถึงข้อความไหนแล้ว และปุ่มสรุปทันที / สรุปแล้วขึ้นแชทใหม่"><input type="checkbox" id="mh_topbar"> ปุ่มบนแถบด้านบนของแชท (ใช้ร่วมกับ Top Info Bar)</label>
           <label class="checkbox_label mh_sub" title="ถ้าไม่ได้ติดตั้ง Top Info Bar จะสร้างแถบบาง ๆ ของ Memory Hub เองเหนือแชท"><input type="checkbox" id="mh_topbar_fb"> ถ้าไม่มี Top Info Bar ให้สร้างแถบเอง</label>
+          <div class="mh_sub mh_iconrow"><span>ไอคอน</span><div id="mh_icons" class="mh_icons"></div></div>
 
           <h4>Prompt สรุป</h4>
           <label class="mh_row"><span>แบบ</span>
@@ -1022,6 +1191,8 @@ function renderSettings() {
     bindCheck('#mh_notify', 'notify');
     bindCheck('#mh_topbar', 'topbar');
     bindCheck('#mh_topbar_fb', 'topbarFallback');
+    $('#mh_icons').html(ICONS.map(ic => `<div class="mh_iconpick" data-icon="${esc(ic)}" title="${esc(iconLabel(ic))}" tabindex="0">${iconHtml(ic)}</div>`).join(''))
+        .on('click', '.mh_iconpick', function () { s.icon = this.dataset.icon; saveSettings(); applyIcon(); });
     bindNum('#mh_chunk', 'chunkSize', 4, 200);
     bindNum('#mh_keep', 'keepRaw', 2, 200);
     bindNum('#mh_memwords', 'memoryWords', 30, 600);
@@ -1255,6 +1426,7 @@ function refreshUi() {
 
     if (managerEl?.isConnected) renderManagerHeader();
     renderTopbar();
+    applyIcon();
 }
 
 // ---------------------------------------------------------------- actions
@@ -1336,7 +1508,7 @@ async function openManager() {
     const root = document.createElement('div');
     root.className = 'mh_manager';
     root.innerHTML = `
-      <h3><i class="fa-solid fa-brain"></i> คลังความจำของแชทนี้</h3>
+      <h3><span class="mh_icon_slot"></span> คลังความจำของแชทนี้</h3>
       <div class="mh_mgr_status"></div>
       <div class="mh_btns">
         <div class="menu_button mh_do_now"><i class="fa-solid fa-wand-magic-sparkles"></i> สรุปตอนนี้ / ย้อนหลัง</div>
@@ -1345,6 +1517,7 @@ async function openManager() {
         <div class="menu_button mh_do_optimize"><i class="fa-solid fa-broom"></i> จัดระเบียบที่นำเข้า (AI)</div>
         <div class="menu_button mh_do_rebuild"><i class="fa-solid fa-book-open"></i> สร้างเรื่องย่อใหม่</div>
         <div class="menu_button mh_do_carry"><i class="fa-solid fa-forward"></i> เริ่มแชทใหม่ต่อเรื่อง</div>
+        <div class="menu_button mh_do_export"><i class="fa-solid fa-file-export"></i> ส่งออก</div>
         <div class="menu_button mh_do_reset"><i class="fa-solid fa-eraser"></i> ล้างทั้งหมด</div>
       </div>
       <label><b>เรื่องย่อจนถึงตอนนี้</b> <small>(แก้ได้ · ถูกเขียนทับเมื่อสรุปก้อนถัดไป)</small></label>
@@ -1354,6 +1527,7 @@ async function openManager() {
     managerEl = root;
     renderManagerHeader();
     renderManagerList();
+    applyIcon(root);
 
     const ov = root.querySelector('.mh_overview_edit');
     const syncOverview = () => { ov.value = state()?.overview ?? ''; };
@@ -1390,6 +1564,7 @@ async function openManager() {
         if (t.closest('.mh_do_import')) { await importDialog(); syncOverview(); renderManagerList(); renderManagerHeader(); return; }
         if (t.closest('.mh_do_optimize')) { if (guardBusy()) return; await optimizeImported(); syncOverview(); renderManagerList(); return; }
         if (t.closest('.mh_do_rebuild')) { if (guardBusy()) return; await rebuildOverview(); syncOverview(); return; }
+        if (t.closest('.mh_do_export')) { await exportDialog(); return; }
         if (t.closest('.mh_do_carry')) { await popup?.completeCancelled(); await continueInNewChat(); return; }
         if (t.closest('.mh_do_reset')) {
             const ok = await ctx().callGenericPopup('ลบความจำและเรื่องย่อทั้งหมดของแชทนี้? (ข้อความในแชทไม่ถูกลบ ข้อความเก่าจะกลับไปถูกส่งแบบเต็มจนกว่าจะสรุปใหม่)', ctx().POPUP_TYPE.CONFIRM);
@@ -1440,6 +1615,9 @@ async function importDialog() {
       <select class="text_pole mh_chat"><option value="">— เลือกแชท —</option>${chats.map(x => `<option value="${esc(x.id)}">${esc(x.label)}</option>`).join('')}</select>
       <div class="menu_button mh_go_chat">นำเข้าจากแชท</div>
       <hr>
+      <p><b>จากไฟล์ที่ส่งออกไว้</b> (.json ของ Memory Hub)</p>
+      <label class="menu_button mh_file_btn"><i class="fa-solid fa-file-import"></i> เลือกไฟล์ .json<input type="file" class="mh_file" accept=".json,application/json" hidden></label>
+      <hr>
       <p><b>จาก lorebook</b> (เช่น ที่ Memory Books สร้างไว้) — ทุกเอนทรีจะกลายเป็นความจำ แล้วถูกดึงตามความเกี่ยวข้องแทนการติดคีย์เวิร์ด</p>
       <select class="text_pole mh_book"><option value="">— เลือก lorebook —</option>${names.map(n => `<option>${esc(n)}</option>`).join('')}</select>
       <label class="checkbox_label"><input type="checkbox" class="mh_skipoff" checked> ข้ามเอนทรีที่ปิดอยู่</label>
@@ -1450,6 +1628,16 @@ async function importDialog() {
       <p><b>จาก Summarize ในตัวของ SillyTavern</b> — ใช้บทสรุปล่าสุดของแชทนี้เป็นเรื่องย่อ</p>
       <div class="menu_button mh_go_sum ${lastSummary ? '' : 'disabled'}">${lastSummary ? 'ใช้บทสรุปล่าสุดเป็นเรื่องย่อ' : 'แชทนี้ไม่มีบทสรุปของ Summarize'}</div>`;
     let optimizeAfter = false;
+    box.querySelector('.mh_file').addEventListener('change', async e => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        try {
+            const data = JSON.parse(await file.text());
+            if (data?.format !== 'memory-hub-export' || !Array.isArray(data.memories)) throw new Error('ไม่ใช่ไฟล์ส่งออกของ Memory Hub');
+            mergeForeign(data, data.chat || file.name);
+        } catch (err) { toast.err(`นำเข้าไฟล์ไม่ได้: ${errText(err)}`); }
+        e.target.value = '';
+    });
     box.addEventListener('click', async e => {
         const t = e.target;
         if (!(t instanceof Element)) return;
@@ -1507,12 +1695,12 @@ function ensureTopbar() {
         host = ownBar;
     }
     if (!barBtn) {
-        barBtn = document.createElement('i');
+        barBtn = document.createElement('div');
         barBtn.id = 'mh_topbar_btn';
-        barBtn.className = 'fa-fw fa-solid fa-brain right_menu_button mh_topbtn';
+        barBtn.className = 'right_menu_button mh_topbtn';
         barBtn.tabIndex = 0;
         barBtn.setAttribute('role', 'button');
-        barBtn.innerHTML = '<span class="mh_topbadge"></span>';
+        barBtn.innerHTML = `<span class="mh_icon_slot"></span><span class="mh_topbadge"></span>`;
         const toggle = () => { barPanel?.classList.toggle('mh_open'); renderTopbar(); };
         barBtn.addEventListener('click', toggle);
         barBtn.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
@@ -1572,6 +1760,7 @@ function renderTopbar() {
     barBtn.title = busy ? `Memory Hub: ${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `Memory Hub: สรุปแล้วถึงข้อความ #${st.lastEnd} · ยังไม่สรุป ${pending}`;
     if (ownBar) ownBar.querySelector('.mh_ownbar_text').textContent = busy ? `${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `สรุปถึง #${st.lastEnd} · ค้าง ${pending}`;
 
+    applyIcon(barBtn);
     if (!barPanel.classList.contains('mh_open')) return;
     const nextAt = st.lastEnd + s.chunkSize + s.keepRaw;
     let jobHtml;
@@ -1587,7 +1776,7 @@ function renderTopbar() {
     if (lastJob && !busy) jobHtml += `<div class="${lastJob.ok ? 'mh_ok' : 'mh_bad'}">${lastJob.ok ? '✔' : '✖'} ${esc(lastJob.text)} <span class="mh_tp_dim">· ${ago(lastJob.at)}</span></div>`;
     const paused = !busy && s.autoSummarize && autoPausedUntil > len;
     barPanel.innerHTML = `
-      <div class="mh_tp_head"><b><i class="fa-solid fa-brain"></i> Memory Hub</b> <span class="mh_tp_dim">${esc(botName())}</span>
+      <div class="mh_tp_head"><b><span class="mh_icon_slot"></span> Memory Hub</b> <span class="mh_tp_dim">${esc(botName())}</span>
         <i class="fa-solid fa-xmark mh_tp_close" data-mh="close" title="ปิด"></i></div>
       <div class="mh_tp_stat">สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> จากทั้งหมด ${len} · ยังไม่สรุป <b>${pending}</b> · ความจำ ${st.memories.length} ก้อน</div>
       <div class="mh_tp_dim">${!s.enabled ? 'Memory Hub ปิดอยู่' : !s.autoSummarize ? 'สรุปอัตโนมัติปิดอยู่' : paused ? `สรุปอัตโนมัติพักไว้หลังล้มเหลว จนถึงข้อความ #${autoPausedUntil - 1} <a href="#" data-mh="resume">ลองตอนนี้</a>` : `สรุปอัตโนมัติรอบถัดไปเมื่อแชทถึงข้อความ #${nextAt}`}</div>
@@ -1598,6 +1787,7 @@ function renderTopbar() {
         <div class="menu_button" data-mh="open"><i class="fa-solid fa-book-open"></i> คลังความจำ</div>
         <div class="menu_button" data-mh="last"><i class="fa-solid fa-eye"></i> ส่งอะไรไปล่าสุด</div>
       </div>`;
+    applyIcon(barPanel);
 }
 
 // ---------------------------------------------------------------- init
@@ -1614,6 +1804,11 @@ function registerCommands() {
         name: 'memhub-now',
         callback: async () => { await summarizeNow(); return ''; },
         helpString: 'Memory Hub: สรุปข้อความที่ยังไม่ได้สรุปทันที',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'memhub-export',
+        callback: async () => { await exportDialog(); return ''; },
+        helpString: 'Memory Hub: ส่งออกคลังความจำของแชทนี้ (Markdown / JSON)',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'memhub-continue',
