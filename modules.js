@@ -77,7 +77,7 @@ export const BUILTIN_MODULES = Object.freeze([
         keep: [
             'clues found, by whom, and what they seem to point to',
             'who knows what: secrets revealed, lies told, and things a character does NOT know yet',
-            'suspects, alibis, contradictions and open questions',
+            'suspects, alibis, contradictions and open questions the story itself raised (never invent suspects or theories)',
         ],
         keys: 'clues, suspects, evidence',
         overview: 'Secrets & clues: what has been revealed, who knows it, and the questions still unanswered',
@@ -170,6 +170,8 @@ export const BUILTIN_MODULES = Object.freeze([
 
 const BASE_KEEP = [
     'events, decisions and their consequences; promises and plans; unresolved threads',
+    'who a character is when first revealed: role, origin, occupation, family ties (e.g. "X is Y\'s uncle")',
+    'agreements, codes, signals and cover stories the characters set up between themselves',
     'injuries, important items, changes of place and time',
 ];
 
