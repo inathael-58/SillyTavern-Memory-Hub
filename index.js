@@ -21,12 +21,12 @@
  * Profiles); when one fails, times out or answers empty, the next is tried.
  */
 
-import { cleanKeys, cleanText, hasSegmenter, nextChunk, parseMany, parseSummary, rankMemories } from './lib.js';
+import { cleanKeys, cleanText, hasSegmenter, isComplete, nextChunk, parseMany, parseSummary, rankMemories } from './lib.js';
 import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords, modulesFromTags } from './modules.js';
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.4.0'; // keep in sync with manifest.json
+const VERSION = '1.4.1'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -282,9 +282,12 @@ function wordBudget() {
     const extra = s.autoWords ? extraWords(activeModules()) : { memory: 0, overview: 0 };
     const memory = s.memoryWords + extra.memory;
     const overview = s.overviewWords + extra.overview;
-    // Thai runs 2-3 tokens a word; leave room so the answer is never cut off
-    const response = Math.max(s.responseLength, Math.ceil((memory + (s.overviewEnabled ? overview : 0)) * 3 + 150));
-    return { memory, overview, response };
+    // Thai runs 3-5 tokens a word and "thinking" models spend part of the budget
+    // on reasoning; the limit only caps the answer, it costs nothing unused
+    const response = Math.max(s.responseLength, Math.ceil((memory + (s.overviewEnabled ? overview : 0)) * 5 + 400));
+    // models cannot count Thai words, so the length is also given as a number of bullets
+    const bullets = Math.min(10, Math.max(4, Math.round(memory / 22)));
+    return { memory, overview, response, bullets };
 }
 
 // ---------------------------------------------------------------- model calls (with fallback chain)
@@ -335,25 +338,52 @@ async function callOne(src, messages, maxTokens, timeoutMs) {
  * Tries each API in order. An API "fails" when it throws, times out, or
  * answers without anything `accept` can use.
  */
-async function callModel(system, user, maxTokens, accept = out => !!String(out ?? '').trim()) {
+/** Set by callModel: the returned answer was cut off (every retry was, too). */
+let lastCallPartial = false;
+
+/**
+ * Tries each API in order. An API "fails" when it throws, times out, or
+ * answers without anything `accept` can use. `complete` tells a finished
+ * answer from one cut off by the token limit: a cut-off answer is retried
+ * once on the same API with twice the limit before moving on, and if every
+ * API only gives cut-off answers, the longest one is used (flagged).
+ */
+async function callModel(system, user, maxTokens, accept = out => !!String(out ?? '').trim(), complete = () => true) {
     const s = settings();
     const order = activeSources();
     const messages = [{ role: 'system', content: system }, { role: 'user', content: user }];
     const errors = [];
+    let partial = null;
+    lastCallPartial = false;
     for (let i = 0; i < order.length; i++) {
         const src = order[i];
         if (job) { job.api = sourceLabel(src); job.attempt = i + 1; job.attempts = order.length; renderTopbar(); }
-        try {
-            const out = await callOne(src, messages, maxTokens, s.timeoutSec * 1000);
-            if (!String(out ?? '').trim()) throw new Error('ได้คำตอบว่าง (อาจโดน safety filter หรือโควต้าหมด)');
-            if (!accept(out)) throw new Error('คำตอบไม่อยู่ในรูปแบบที่ต้องการ');
-            if (i > 0) toast.warn(`${errors.join(' · ')}\n→ ใช้ ${sourceLabel(src)} แทนแล้ว`, { timeOut: 8000 });
-            lastApi = { ok: true, label: sourceLabel(src), fallback: i > 0, at: Date.now() };
-            return out;
-        } catch (e) {
-            console.warn(LOG, `API ${sourceLabel(src)} failed`, e);
-            errors.push(`${sourceLabel(src)}: ${errText(e)}`);
+        let limit = maxTokens;
+        for (let round = 0; round < 2; round++) {
+            try {
+                const out = await callOne(src, messages, limit, s.timeoutSec * 1000);
+                if (!String(out ?? '').trim()) throw new Error('ได้คำตอบว่าง (อาจโดน safety filter หรือโควต้าหมด)');
+                if (!accept(out)) throw new Error('คำตอบไม่อยู่ในรูปแบบที่ต้องการ');
+                if (!complete(out)) {
+                    if (!partial || out.length > partial.length) partial = out;
+                    if (round === 0) { limit = Math.min(16000, limit * 2); console.warn(LOG, `answer cut off, retrying with ${limit} tokens`); continue; }
+                    throw new Error(`คำตอบถูกตัดกลางคัน แม้ขยายเป็น ${limit} โทเคนแล้ว (โมเดลอาจใช้โทเคนไปกับการคิด)`);
+                }
+                if (i > 0) toast.warn(`${errors.join(' · ')}\n→ ใช้ ${sourceLabel(src)} แทนแล้ว`, { timeOut: 8000 });
+                lastApi = { ok: true, label: sourceLabel(src), fallback: i > 0, at: Date.now() };
+                return out;
+            } catch (e) {
+                console.warn(LOG, `API ${sourceLabel(src)} failed`, e);
+                errors.push(`${sourceLabel(src)}: ${errText(e)}`);
+                break;
+            }
         }
+    }
+    if (partial) {
+        lastCallPartial = true;
+        lastApi = { ok: true, label: `${sourceLabel(order[0])} (คำตอบไม่ครบ)`, at: Date.now() };
+        toast.warn(`ทุก API ตอบไม่จบ ใช้คำตอบที่ได้ไปก่อน ความจำก้อนนี้จะมี ⚠ — ลองเพิ่ม Response length แล้วกด 🔄 สรุปใหม่\n${errors.join(' · ')}`, { timeOut: 15000 });
+        return partial;
     }
     lastApi = { ok: false, label: sourceLabel(order[0]), error: errors.join(' · '), at: Date.now() };
     throw new Error(errors.join(' · '));
@@ -386,7 +416,8 @@ function fill(template, withOverview) {
         .replaceAll('{{overview_rule}}', withOverview ? buildOverviewRule(activeModules()) : '')
         .replaceAll('{{overview_format}}', withOverview ? OVERVIEW_FORMAT : '')
         .replaceAll('{{overview_words}}', String(w.overview))
-        .replaceAll('{{memory_words}}', String(w.memory));
+        .replaceAll('{{memory_words}}', String(w.memory))
+        .replaceAll('{{memory_bullets}}', String(w.bullets));
     return ctx().substituteParams(p);
 }
 
@@ -414,7 +445,9 @@ async function summarizeRange(start, end, { replaceId = null, updateOverview = t
     parts.push(`NEW MESSAGES (#${start}–#${end}):\n${body}`);
 
     const raw = await callModel(fill(summaryTemplate(), withOverview), ctx().substituteParams(parts.join("\n\n")), wordBudget().response,
-        out => !!parseSummary(out).text);
+        out => !!parseSummary(out).text, out => isComplete(out, { overview: withOverview }));
+    // flag the memory only when the memory part itself was cut (a missing overview just keeps the old one)
+    const partial = lastCallPartial && !isComplete(raw);
     if (ctx().chatId !== chatId) throw new Error('เปลี่ยนแชทระหว่างสรุป ผลลัพธ์ถูกทิ้ง');
 
     const parsed = parseSummary(raw);
@@ -423,10 +456,10 @@ async function summarizeRange(start, end, { replaceId = null, updateOverview = t
     let mem;
     if (replaceId) {
         mem = cur.memories.find(m => m.id === replaceId);
-        if (mem) Object.assign(mem, { title: parsed.title || mem.title, keys: keys.length ? keys : mem.keys, text: parsed.text, ts: Date.now() });
+        if (mem) Object.assign(mem, { title: parsed.title || mem.title, keys: keys.length ? keys : mem.keys, text: parsed.text, ts: Date.now(), truncated: partial || undefined });
     }
     if (!mem) {
-        mem = { id: uid(), start, end, title: parsed.title || `#${start}–#${end}`, keys, text: parsed.text, pinned: false, source: 'auto', ts: Date.now() };
+        mem = { id: uid(), start, end, title: parsed.title || `#${start}–#${end}`, keys, text: parsed.text, pinned: false, source: 'auto', ts: Date.now(), ...(partial ? { truncated: true } : {}) };
         cur.memories.push(mem);
         cur.memories.sort((a, b) => (a.start - b.start) || (a.ts - b.ts));
         cur.lastEnd = Math.max(cur.lastEnd, end);
@@ -867,7 +900,7 @@ async function optimizeImported({ onlyLong = true } = {}) {
                 if (progress) globalThis.toastr?.clear(progress);
                 progress = toast.info(`จัดระเบียบความจำที่นำเข้า ชุด ${bi + 1}/${batches.length}…`, { timeOut: 0, extendedTimeOut: 0 });
                 const user = batch.map((m, i) => `MEMORY id="${i}":\ntitle: ${m.title}\nkeys: ${(m.keys ?? []).join(', ')}\n${cleanText(m.text, 12000)}`).join('\n\n');
-                const raw = await callModel(system, ctx().substituteParams(user), Math.min(4000, 350 * batch.length + 200), out => parseMany(out).size > 0);
+                const raw = await callModel(system, ctx().substituteParams(user), Math.min(4000, 350 * batch.length + 200), out => parseMany(out).size > 0, out => parseMany(out).size >= batch.length);
                 const got = parseMany(raw);
                 batch.forEach((m, i) => {
                     const r = got.get(String(i));
@@ -920,7 +953,7 @@ async function rebuildOverview() {
                 if (progress) globalThis.toastr?.clear(progress);
                 progress = toast.info(`สร้างเรื่องย่อใหม่ ${bi + 1}/${batches.length}…`, { timeOut: 0, extendedTimeOut: 0 });
                 const user = `PREVIOUS OVERVIEW:\n${overview || '(none yet)'}\n\nMEMORIES:\n${batch.map(memoryBlock).join('\n')}`;
-                const raw = await callModel(fill(PROMPT_REBUILD, true), ctx().substituteParams(user), wordBudget().response, out => !!parseSummary(out).overview);
+                const raw = await callModel(fill(PROMPT_REBUILD, true), ctx().substituteParams(user), wordBudget().response, out => !!parseSummary(out).overview, out => isComplete(out, { memory: false, overview: true }));
                 overview = parseSummary(raw).overview || overview;
             }
             const now = state();
@@ -1037,7 +1070,7 @@ function exportMarkdown(x) {
     x.memories.forEach((m, i) => {
         const where = m.end >= 0 ? `#${m.start}–#${m.end}` : m.source === 'carry' ? 'จากแชทก่อน' : m.source === 'import' ? 'นำเข้า' : 'เพิ่มเอง';
         const st = m.stats.srcTokens ? ` · ต้นฉบับ ${m.stats.srcTokens} → ${m.stats.memTokens} โทเคน (${pct(m.stats.ratio)})` : ` · ${m.stats.memTokens} โทเคน`;
-        lines.push(`### ${i + 1}. ${m.title || '(ไม่มีชื่อ)'}${m.pinned ? ' 📌' : ''}`, '', `_${where}${st}_  `, `คีย์: ${(m.keys ?? []).join(', ') || '—'}`, '', String(m.text ?? '').trim(), '');
+        lines.push(`### ${i + 1}. ${m.title || '(ไม่มีชื่อ)'}${m.pinned ? ' 📌' : ''}${m.truncated ? ' ⚠ คำตอบถูกตัด' : ''}`, '', `_${where}${st}_  `, `คีย์: ${(m.keys ?? []).join(', ') || '—'}`, '', String(m.text ?? '').trim(), '');
         if (m.sourceMessages?.length) {
             lines.push('<details><summary>ข้อความต้นฉบับ</summary>', '');
             for (const s of m.sourceMessages) lines.push(`> **${s.name}:** ${s.mes.replace(/\n+/g, ' ')}`, '>');
@@ -1478,6 +1511,7 @@ function memoryCard(m, recalled) {
       <div class="mh_card_head">
         <input class="text_pole mh_title" value="${esc(m.title)}" placeholder="ชื่อ">
         <span class="mh_range" title="${esc(m.origin?.chat ?? '')}">${esc(range)}</span>
+        ${m.truncated ? '<span class="mh_trunc" title="คำตอบของโมเดลถูกตัดกลางคัน ความจำนี้อาจไม่ครบ — เพิ่ม Response length แล้วกด 🔄">⚠ ไม่ครบ</span>' : ''}
         <i class="fa-solid fa-thumbtack mh_icon mh_pin" title="ปักหมุด: ใส่ใน prompt ทุกครั้ง"></i>
         ${m.end >= 0 && m.source === 'auto' ? '<i class="fa-solid fa-rotate mh_icon mh_resum" title="สรุปช่วงนี้ใหม่ (เช่น หลังแก้ข้อความ)"></i>' : ''}
         <i class="fa-solid fa-trash mh_icon mh_del" title="ลบ"></i>

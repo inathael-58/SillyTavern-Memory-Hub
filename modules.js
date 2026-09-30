@@ -215,8 +215,8 @@ ${bullets(keep)}
 - Skip ${[...new Set(skip)].join(', ')}.
 - Always write names in full instead of "he/she": memories are read out of order.
 - Be concrete. No commentary, no guessing.
-- summary: short bullet points, at most {{memory_words}} words in total.
-- keys: 3-8 distinctive words someone would say when this memory becomes relevant again (${[...new Set(keyKinds.join(', ').split(/,\s*/))].join(', ')}). Never use {{user}} or {{char}} alone as a key.
+- summary: at most {{memory_bullets}} bullets, one short sentence each (about {{memory_words}} words in total). One bullet per story beat; merge small beats. Keep a detail only if it would still matter 50 messages later; leave out teasing and banter unless it changed something.
+- keys: 3-8 names of concrete things someone would say when this memory becomes relevant again (${[...new Set(keyKinds.join(', ').split(/,\s*/))].join(', ')}). Not adjectives, jokes or body parts. Never use {{user}} or {{char}} alone as a key.
 {{overview_rule}}
 Answer in exactly this format and nothing else:
 <memory>
@@ -231,12 +231,12 @@ summary:
 export function buildOverviewRule(mods) {
     const heads = mods.map(m => m.overview).filter(Boolean);
     if (!heads.length) {
-        return '- overview: rewrite PREVIOUS OVERVIEW so it also covers the new memory. It is the story so far in at most {{overview_words}} words: who is who, where things stand, what happened that still matters, where they are now, open threads. Drop details that no longer matter.';
+        return '- overview: rewrite PREVIOUS OVERVIEW so it also covers the new memory. It is the story so far in at most {{overview_words}} words: who is who, where things stand, what happened that still matters, where they are now, open threads. Drop details that no longer matter, but never drop who is who (identities, disguises, who is in which body) or a secret that is still hidden.';
     }
     const all = [...heads, 'Now: where everyone is and what is happening at this moment', 'Open threads: promises, plans and unresolved matters'];
     return `- overview: rewrite PREVIOUS OVERVIEW as the CURRENT STATE of the story, at most {{overview_words}} words in total, under these headings (skip a heading if there is nothing for it):
 ${all.map(h => `  ${h}`).join('\n')}
-  Drop what is resolved and no longer matters.`;
+  Write the headings in the story's language. Drop what is resolved and no longer matters, but never drop who is who (identities, disguises, who is in which body) or a secret that is still hidden.`;
 }
 
 /** Extra room the chosen modules need on top of the base settings. */
