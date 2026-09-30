@@ -99,3 +99,24 @@
 .mh_src .mh_off { visibility: hidden; }
 .mh_carry { text-align: left; }
 .mh_carry small { display: block; opacity: 0.75; margin-top: 0.5em; }
+
+/* ---------------------------------------------------------------- 1.2 prompt modules */
+.mh_modbox { border: 1px solid var(--SmartThemeBorderColor, #555); border-radius: 8px; padding: 0.5em 0.6em; margin: 0.3em 0; }
+.mh_modbox .mh_modhead { margin-bottom: 0.1em; }
+.mh_mods { display: flex; flex-wrap: wrap; gap: 0.3em; margin: 0.4em 0; }
+.mh_mod {
+    display: inline-flex; align-items: center; gap: 0.3em;
+    padding: 0.2em 0.6em; border: 1px solid var(--SmartThemeBorderColor, #555); border-radius: 999px;
+    cursor: pointer; font-size: 0.9em; user-select: none;
+}
+.mh_mod input { margin: 0; }
+.mh_mod.mh_on { border-color: var(--SmartThemeQuoteColor, #e18a24); background: color-mix(in srgb, var(--SmartThemeQuoteColor, #e18a24) 15%, transparent); }
+.mh_modmgr { text-align: left; }
+.mh_modcard { border: 1px solid var(--SmartThemeBorderColor, #555); border-radius: 8px; padding: 0.5em 0.6em; margin-bottom: 0.6em; display: flex; flex-direction: column; gap: 0.2em; }
+.mh_modcard:not(.mh_editable) { opacity: 0.85; }
+.mh_modcard.mh_editable { border-color: var(--SmartThemeQuoteColor, #e18a24); }
+.mh_modcard .text_pole { margin: 0; width: 100%; box-sizing: border-box; }
+.mh_modcard label { font-size: 0.85em; opacity: 0.8; margin-top: 0.2em; }
+.mh_modcard .mh_row input[type="number"] { flex: 0 0 5em; width: 5em; }
+.mh_modcard .mh_mod_copy { width: auto; padding: 0.2em 0.8em; margin: 0; }
+.mh_modcard .mh_card_head .mh_title { flex: 1 1 auto; min-width: 0; font-weight: bold; }
