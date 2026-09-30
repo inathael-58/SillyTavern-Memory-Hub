@@ -1,0 +1,86 @@
+/* Memory Hub — follows the active SillyTavern theme through its variables. */
+
+.memory-hub-settings h4 { margin: 0.8em 0 0.3em; }
+.memory-hub-settings .mh_version { opacity: 0.6; font-weight: normal; }
+.memory-hub-settings .mh_status {
+    padding: 0.5em 0.7em;
+    margin-bottom: 0.4em;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 8px;
+    font-size: 0.92em;
+    line-height: 1.5;
+}
+.memory-hub-settings .mh_warn:empty { display: none; }
+.memory-hub-settings .mh_warn {
+    margin: 0.4em 0;
+    padding: 0.4em 0.7em;
+    border-left: 3px solid #f5a524;
+    font-size: 0.9em;
+}
+.memory-hub-settings .mh_warn i { color: #f5a524; }
+.memory-hub-settings .mh_note { display: block; margin-top: 0.8em; opacity: 0.75; }
+.memory-hub-settings .mh_adv { margin-top: 0.8em; }
+.memory-hub-settings textarea { width: 100%; box-sizing: border-box; font-size: 0.88em; }
+
+.mh_row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6em;
+    margin: 0.2em 0;
+}
+.mh_row > span { flex: 1 1 auto; min-width: 0; }
+.mh_row > input[type="number"] { flex: 0 0 5.5em; width: 5.5em; margin: 0; }
+.mh_row > select { flex: 0 1 60%; margin: 0; min-width: 0; }
+
+.mh_btns { display: flex; flex-wrap: wrap; gap: 0.3em; margin: 0.4em 0; }
+.mh_btns .menu_button { width: auto; flex: 1 1 auto; white-space: nowrap; padding: 0.35em 0.7em; }
+
+/* ---------------------------------------------------------------- manager popup */
+.mh_manager { text-align: left; }
+.mh_manager h3 { margin: 0 0 0.3em; }
+.mh_manager .mh_mgr_status { opacity: 0.85; font-size: 0.92em; margin-bottom: 0.4em; }
+.mh_manager .mh_overview_edit { width: 100%; box-sizing: border-box; }
+.mh_manager .mh_list_head { display: flex; align-items: center; gap: 0.6em; margin: 0.8em 0 0.3em; }
+.mh_manager .mh_list_head > b { white-space: nowrap; }
+.mh_manager .mh_search { flex: 1 1 auto; margin: 0; }
+.mh_manager .mh_empty { opacity: 0.7; padding: 1em 0; text-align: center; }
+
+.mh_card {
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 8px;
+    padding: 0.45em 0.55em;
+    margin-bottom: 0.5em;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3em;
+}
+.mh_card.mh_pinned { border-color: var(--SmartThemeQuoteColor, #e18a24); }
+.mh_card.mh_recalled { box-shadow: inset 3px 0 0 var(--SmartThemeQuoteColor, #e18a24); }
+.mh_card .text_pole { margin: 0; width: 100%; box-sizing: border-box; }
+.mh_card textarea { font-size: 0.9em; resize: vertical; }
+.mh_card_head { display: flex; align-items: center; gap: 0.45em; }
+.mh_card_head .mh_title { flex: 1 1 auto; min-width: 0; font-weight: bold; }
+.mh_card .mh_range { font-size: 0.8em; opacity: 0.7; white-space: nowrap; }
+.mh_card .mh_icon { cursor: pointer; opacity: 0.55; padding: 0.25em; }
+.mh_card .mh_icon:hover { opacity: 1; }
+.mh_card.mh_pinned .mh_pin { opacity: 1; color: var(--SmartThemeQuoteColor, #e18a24); }
+.mh_card .mh_keys { font-size: 0.85em; }
+.mh_card .mh_tag { opacity: 0.75; color: var(--SmartThemeQuoteColor, #e18a24); }
+
+.mh_preview { text-align: left; }
+.mh_preview pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.85em;
+    padding: 0.5em;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 6px;
+}
+.mh_import { text-align: left; }
+.mh_import .menu_button { width: auto; display: inline-flex; }
+
+@media (max-width: 600px) {
+    .mh_btns .menu_button { flex: 1 1 45%; }
+    .mh_row > select { flex-basis: 55%; }
+}
