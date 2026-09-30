@@ -172,3 +172,34 @@ export function rankMemories(memories, queryText, { k1 = 1.2, b = 0.75 } = {}) {
         return { memory: m, score, hits };
     }).sort((a, b) => b.score - a.score);
 }
+
+/**
+ * Several <memory id="n"> blocks in one answer (batch rewrite of imports).
+ * @returns {Map<string, {title:string, keys:string[], text:string}>}
+ */
+export function parseMany(raw) {
+    const txt = String(raw ?? '').replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
+    const out = new Map();
+    const rx = /<memory\s+id\s*=\s*["']?([\w-]+)["']?\s*>([\s\S]*?)<\/memory>/gi;
+    let m;
+    while ((m = rx.exec(txt))) {
+        const p = parseSummary(`<memory>${m[2]}</memory>`);
+        if (p.text) out.set(m[1], { title: p.title, keys: p.keys, text: p.text });
+    }
+    return out;
+}
+
+/** Drops keys that are just a main character's name or too short to mean anything. */
+export function cleanKeys(keys, names = []) {
+    const ban = new Set(names.map(n => String(n ?? '').trim().toLowerCase()).filter(Boolean));
+    const seen = new Set();
+    const out = [];
+    for (const k of keys ?? []) {
+        const s = String(k ?? '').trim();
+        const l = s.toLowerCase();
+        if (s.length < 2 || ban.has(l) || seen.has(l)) continue;
+        seen.add(l);
+        out.push(s);
+    }
+    return out;
+}
