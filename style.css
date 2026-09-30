@@ -84,3 +84,18 @@
     .mh_btns .menu_button { flex: 1 1 45%; }
     .mh_row > select { flex-basis: 55%; }
 }
+
+/* ---------------------------------------------------------------- 1.1 */
+.mh_hidden { display: none !important; }
+.memory-hub-settings .mh_hint { display: block; opacity: 0.75; margin: 0.2em 0 0.4em; }
+.memory-hub-settings .mh_ok { color: #3fb950; }
+.memory-hub-settings .mh_bad { color: #e5484d; }
+.mh_sources { display: flex; flex-direction: column; gap: 0.3em; margin: 0.3em 0; }
+.mh_src { display: flex; align-items: center; gap: 0.4em; }
+.mh_src select { flex: 1 1 auto; margin: 0; min-width: 0; }
+.mh_src .mh_src_n { opacity: 0.7; min-width: 1.4em; }
+.mh_src .mh_icon { cursor: pointer; opacity: 0.6; padding: 0.3em; }
+.mh_src .mh_icon:hover { opacity: 1; }
+.mh_src .mh_off { visibility: hidden; }
+.mh_carry { text-align: left; }
+.mh_carry small { display: block; opacity: 0.75; margin-top: 0.5em; }
