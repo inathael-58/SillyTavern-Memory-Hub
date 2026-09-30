@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.2.0'; // keep in sync with manifest.json
+const VERSION = '1.3.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -120,6 +120,8 @@ const DEFAULTS = Object.freeze({
     recallTemplate: '[Memories from earlier in the story that matter now]\n{{memories}}',
     notify: true,
     carrySummarizeRest: true,
+    topbar: true,           // button + panel in the chat top bar (Top Info Bar extension)
+    topbarFallback: true,   // our own slim bar when Top Info Bar is not installed
 });
 
 // ---------------------------------------------------------------- helpers
@@ -259,6 +261,10 @@ function wordBudget() {
 // ---------------------------------------------------------------- model calls (with fallback chain)
 
 let lastApi = null; // { ok:boolean, label:string, error?:string, at:number, fallback?:boolean }
+/** What is running now, for the top bar: { label, done, total, range?, api?, attempt? } */
+let job = null;
+let queued = 0;       // summary runs waiting behind the current one
+let lastJob = null;   // { ok:boolean, text:string, at:number }
 
 function profiles() {
     try { return ctx().ConnectionManagerRequestService?.getSupportedProfiles?.() ?? []; } catch { return []; }
@@ -307,6 +313,7 @@ async function callModel(system, user, maxTokens, accept = out => !!String(out ?
     const errors = [];
     for (let i = 0; i < order.length; i++) {
         const src = order[i];
+        if (job) { job.api = sourceLabel(src); job.attempt = i + 1; job.attempts = order.length; renderTopbar(); }
         try {
             const out = await callOne(src, messages, maxTokens, s.timeoutSec * 1000);
             if (!String(out ?? '').trim()) throw new Error('ได้คำตอบว่าง (อาจโดน safety filter หรือโควต้าหมด)');
@@ -406,13 +413,29 @@ async function summarizeRange(start, end, { replaceId = null, updateOverview = t
  * @param {{force?:boolean, quiet?:boolean, keepRaw?:number}} opt force = also take a last partial chunk
  * @returns {Promise<{made:number, failed:boolean}>}
  */
+/** How many chunks a run would take right now. */
+function plannedChunks(force, keepRaw) {
+    const st = state();
+    if (!st) return 0;
+    const s = settings();
+    let n = 0;
+    let end = st.lastEnd;
+    for (let c = nextChunk(end, ctx().chat.length, s.chunkSize, keepRaw ?? s.keepRaw, force); c && n < 10000; c = nextChunk(end, ctx().chat.length, s.chunkSize, keepRaw ?? s.keepRaw, force)) { n++; end = c.end; }
+    return n;
+}
+
 function runSummaries({ force = false, quiet = false, keepRaw = null } = {}) {
-    if (busy) return busy.then(() => runSummaries({ force, quiet, keepRaw }));
+    if (busy) {
+        queued++; renderTopbar();
+        return busy.then(() => { queued = Math.max(0, queued - 1); return runSummaries({ force, quiet, keepRaw }); });
+    }
     cancelRequested = false;
     busy = (async () => {
         let made = 0;
         let failed = false;
         let progress = null;
+        job = { label: 'สรุปข้อความ', done: 0, total: plannedChunks(force, keepRaw) };
+        renderTopbar();
         try {
             for (;;) {
                 if (cancelRequested) break;
@@ -421,11 +444,15 @@ function runSummaries({ force = false, quiet = false, keepRaw = null } = {}) {
                 const s = settings();
                 const chunk = nextChunk(st.lastEnd, ctx().chat.length, s.chunkSize, keepRaw ?? s.keepRaw, force);
                 if (!chunk) break;
-                if (!quiet || made > 0) {
+                // the top bar panel already shows progress; no toast on top of it
+                if ((!quiet || made > 0) && !barPanel?.classList.contains('mh_open')) {
                     if (progress) globalThis.toastr?.clear(progress);
                     progress = toast.info(`กำลังสรุปข้อความ #${chunk.start}–#${chunk.end}…`, { timeOut: 0, extendedTimeOut: 0 });
                 }
+                job.range = `#${chunk.start}–#${chunk.end}`;
+                renderTopbar();
                 const mem = await summarizeRange(chunk.start, chunk.end);
+                job.done++;
                 if (!mem) { state().lastEnd = chunk.end; saveState(); continue; }
                 made++;
                 refreshUi();
@@ -434,10 +461,13 @@ function runSummaries({ force = false, quiet = false, keepRaw = null } = {}) {
             failed = true;
             console.error(LOG, e);
             autoPausedUntil = ctx().chat.length + 4;
+            lastJob = { ok: false, text: `สรุป ${job?.range ?? ''} ไม่สำเร็จ: ${errText(e)}`, at: Date.now() };
             toast.err(`สรุปไม่สำเร็จ ลองครบทุก API แล้ว:\n${errText(e)}`, { timeOut: 15000 });
         } finally {
             if (progress) globalThis.toastr?.clear(progress);
             busy = null;
+            job = null;
+            if (made && !failed) lastJob = { ok: true, text: `สร้างความจำใหม่ ${made} ก้อน`, at: Date.now() };
             refreshUi();
         }
         if (made && (settings().notify || !quiet)) toast.ok(`สร้างความจำใหม่ ${made} ก้อน`);
@@ -794,10 +824,12 @@ async function optimizeImported({ onlyLong = true } = {}) {
     let done = 0;
     let progress = null;
     cancelRequested = false;
+    job = { label: 'จัดระเบียบที่นำเข้า', done: 0, total: batches.length };
     busy = (async () => {
         try {
             for (const [bi, batch] of batches.entries()) {
                 if (cancelRequested) break;
+                job.done = bi; job.range = `ชุด ${bi + 1}`; renderTopbar();
                 if (progress) globalThis.toastr?.clear(progress);
                 progress = toast.info(`จัดระเบียบความจำที่นำเข้า ชุด ${bi + 1}/${batches.length}…`, { timeOut: 0, extendedTimeOut: 0 });
                 const user = batch.map((m, i) => `MEMORY id="${i}":\ntitle: ${m.title}\nkeys: ${(m.keys ?? []).join(', ')}\n${cleanText(m.text, 12000)}`).join('\n\n');
@@ -816,9 +848,12 @@ async function optimizeImported({ onlyLong = true } = {}) {
             }
         } catch (e) {
             toast.err(`จัดระเบียบไม่สำเร็จ: ${errText(e)}`, { timeOut: 15000 });
+            lastJob = { ok: false, text: `จัดระเบียบไม่สำเร็จ: ${errText(e)}`, at: Date.now() };
         } finally {
             if (progress) globalThis.toastr?.clear(progress);
             busy = null;
+            job = null;
+            renderTopbar();
         }
     })();
     await busy;
@@ -843,9 +878,11 @@ async function rebuildOverview() {
     if (cur.length) batches.push(cur);
     let overview = '';
     let progress = null;
+    job = { label: 'สร้างเรื่องย่อใหม่', done: 0, total: batches.length };
     busy = (async () => {
         try {
             for (const [bi, batch] of batches.entries()) {
+                job.done = bi; job.range = `ชุด ${bi + 1}`; renderTopbar();
                 if (progress) globalThis.toastr?.clear(progress);
                 progress = toast.info(`สร้างเรื่องย่อใหม่ ${bi + 1}/${batches.length}…`, { timeOut: 0, extendedTimeOut: 0 });
                 const user = `PREVIOUS OVERVIEW:\n${overview || '(none yet)'}\n\nMEMORIES:\n${batch.map(memoryBlock).join('\n')}`;
@@ -859,9 +896,12 @@ async function rebuildOverview() {
             toast.ok('สร้างเรื่องย่อใหม่แล้ว');
         } catch (e) {
             toast.err(`สร้างเรื่องย่อไม่สำเร็จ: ${errText(e)}`, { timeOut: 15000 });
+            lastJob = { ok: false, text: `สร้างเรื่องย่อไม่สำเร็จ: ${errText(e)}`, at: Date.now() };
         } finally {
             if (progress) globalThis.toastr?.clear(progress);
             busy = null;
+            job = null;
+            renderTopbar();
         }
     })();
     await busy;
@@ -898,6 +938,8 @@ function renderSettings() {
           <label class="checkbox_label"><input type="checkbox" id="mh_overview"> มี "เรื่องย่อจนถึงตอนนี้" หนึ่งก้อน</label>
           <label class="checkbox_label"><input type="checkbox" id="mh_latest"> ใส่ความจำก้อนล่าสุดเสมอ (ต่อเนื่องกับข้อความดิบ)</label>
           <label class="checkbox_label"><input type="checkbox" id="mh_notify"> แจ้งเตือนเมื่อสร้างความจำใหม่</label>
+          <label class="checkbox_label" title="ปุ่มสมองบนแถบด้านบนของแชท: ดูคิวที่กำลังสรุป สรุปถึงข้อความไหนแล้ว และปุ่มสรุปทันที / สรุปแล้วขึ้นแชทใหม่"><input type="checkbox" id="mh_topbar"> ปุ่มบนแถบด้านบนของแชท (ใช้ร่วมกับ Top Info Bar)</label>
+          <label class="checkbox_label mh_sub" title="ถ้าไม่ได้ติดตั้ง Top Info Bar จะสร้างแถบบาง ๆ ของ Memory Hub เองเหนือแชท"><input type="checkbox" id="mh_topbar_fb"> ถ้าไม่มี Top Info Bar ให้สร้างแถบเอง</label>
 
           <h4>Prompt สรุป</h4>
           <label class="mh_row"><span>แบบ</span>
@@ -978,6 +1020,8 @@ function renderSettings() {
     bindCheck('#mh_overview', 'overviewEnabled');
     bindCheck('#mh_latest', 'includeLatest');
     bindCheck('#mh_notify', 'notify');
+    bindCheck('#mh_topbar', 'topbar');
+    bindCheck('#mh_topbar_fb', 'topbarFallback');
     bindNum('#mh_chunk', 'chunkSize', 4, 200);
     bindNum('#mh_keep', 'keepRaw', 2, 200);
     bindNum('#mh_memwords', 'memoryWords', 30, 600);
@@ -1210,6 +1254,7 @@ function refreshUi() {
     $('#mh_warn').html(warns.map(w => `<div><i class="fa-solid fa-triangle-exclamation"></i> ${esc(w)}</div>`).join(''));
 
     if (managerEl?.isConnected) renderManagerHeader();
+    renderTopbar();
 }
 
 // ---------------------------------------------------------------- actions
@@ -1366,10 +1411,11 @@ async function openManager() {
             if (guardBusy()) return;
             t.classList.add('fa-spin');
             try {
+                job = { label: 'สรุปช่วงนี้ใหม่', done: 0, total: 1, range: `#${m.start}–#${m.end}` };
                 busy = summarizeRange(m.start, m.end, { replaceId: m.id, updateOverview: false });
                 await busy;
                 toast.ok('สรุปช่วงนี้ใหม่แล้ว');
-            } catch (err) { toast.err(`สรุปไม่สำเร็จ: ${errText(err)}`, { timeOut: 15000 }); } finally { busy = null; }
+            } catch (err) { toast.err(`สรุปไม่สำเร็จ: ${errText(err)}`, { timeOut: 15000 }); } finally { busy = null; job = null; renderTopbar(); }
             renderManagerList(); refreshUi();
         }
     });
@@ -1428,6 +1474,132 @@ async function importDialog() {
     if (optimizeAfter && !busy) await optimizeImported();
 }
 
+// ---------------------------------------------------------------- chat top bar
+
+const TOPBAR_ID = 'extensionTopBar';            // SillyTavern's "Top Info Bar" extension
+const TOPBAR_NAME_ID = 'extensionTopBarChatName';
+let barBtn = null;
+let barPanel = null;
+let ownBar = null;
+
+function removeTopbar() {
+    barBtn?.remove(); barPanel?.remove(); ownBar?.remove();
+}
+
+/** Puts the button in the top bar (before the chat name, like Memory Books) and the panel under it. */
+function ensureTopbar() {
+    const s = settings();
+    if (!s.topbar) { removeTopbar(); return false; }
+    let host = document.getElementById(TOPBAR_ID);
+    if (host) {
+        ownBar?.remove();
+    } else {
+        if (!s.topbarFallback) { removeTopbar(); return false; }
+        const sheld = document.getElementById('sheld');
+        const chat = document.getElementById('chat');
+        if (!sheld || !chat) return false;
+        if (!ownBar) {
+            ownBar = document.createElement('div');
+            ownBar.id = 'mh_ownbar';
+            ownBar.innerHTML = '<span class="mh_ownbar_text"></span>';
+        }
+        if (ownBar.parentElement !== sheld) sheld.insertBefore(ownBar, chat);
+        host = ownBar;
+    }
+    if (!barBtn) {
+        barBtn = document.createElement('i');
+        barBtn.id = 'mh_topbar_btn';
+        barBtn.className = 'fa-fw fa-solid fa-brain right_menu_button mh_topbtn';
+        barBtn.tabIndex = 0;
+        barBtn.setAttribute('role', 'button');
+        barBtn.innerHTML = '<span class="mh_topbadge"></span>';
+        const toggle = () => { barPanel?.classList.toggle('mh_open'); renderTopbar(); };
+        barBtn.addEventListener('click', toggle);
+        barBtn.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+    }
+    const name = document.getElementById(TOPBAR_NAME_ID);
+    if (barBtn.parentElement !== host) {
+        if (host === ownBar) host.prepend(barBtn);
+        else if (name?.parentElement === host) host.insertBefore(barBtn, name);
+        else host.appendChild(barBtn);
+    }
+    if (!barPanel) {
+        barPanel = document.createElement('div');
+        barPanel.id = 'mh_topbar_panel';
+        barPanel.addEventListener('click', onTopbarClick);
+    }
+    if (barPanel.parentElement !== host.parentElement) host.after(barPanel);
+    return true;
+}
+
+async function onTopbarClick(e) {
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    const a = t.closest('[data-mh]')?.dataset.mh;
+    if (!a) return;
+    e.preventDefault();
+    if (a === 'close') barPanel.classList.remove('mh_open');
+    else if (a === 'now') await summarizeNow();
+    else if (a === 'carry') await continueInNewChat();
+    else if (a === 'open') await openManager();
+    else if (a === 'last') await showLastInjection();
+    else if (a === 'stop') { cancelRequested = true; toast.info('จะหยุดหลังก้อนที่กำลังทำเสร็จ'); }
+    else if (a === 'resume') { autoPausedUntil = 0; onMessageReceived(null, 'normal'); }
+    renderTopbar();
+}
+
+const ago = ts => {
+    const m = Math.round((Date.now() - ts) / 60000);
+    return m < 1 ? 'เมื่อกี้' : m < 60 ? `${m} นาทีที่แล้ว` : new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+};
+
+function renderTopbar() {
+    if (!ensureTopbar()) return;
+    const s = settings();
+    const st = state();
+    const inChat = !!st;
+    barBtn.classList.toggle('mh_busy', !!busy);
+    barBtn.classList.toggle('mh_hidden', !inChat);
+    const badge = barBtn.querySelector('.mh_topbadge');
+    if (!inChat) { barPanel.classList.remove('mh_open'); if (ownBar) ownBar.classList.add('mh_hidden'); return; }
+    ownBar?.classList.remove('mh_hidden');
+
+    const len = ctx().chat.length;
+    const pending = Math.max(0, len - 1 - st.lastEnd);
+    const failed = lastJob && !lastJob.ok && !busy;
+    badge.textContent = busy && job ? `${Math.min(job.done + 1, job.total || 1)}/${job.total || 1}` : (st.lastEnd >= 0 ? `#${st.lastEnd}` : '');
+    badge.classList.toggle('mh_bad', !!failed);
+    barBtn.title = busy ? `Memory Hub: ${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `Memory Hub: สรุปแล้วถึงข้อความ #${st.lastEnd} · ยังไม่สรุป ${pending}`;
+    if (ownBar) ownBar.querySelector('.mh_ownbar_text').textContent = busy ? `${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `สรุปถึง #${st.lastEnd} · ค้าง ${pending}`;
+
+    if (!barPanel.classList.contains('mh_open')) return;
+    const nextAt = st.lastEnd + s.chunkSize + s.keepRaw;
+    let jobHtml;
+    if (busy && job) {
+        jobHtml = `<div class="mh_tp_job"><i class="fa-solid fa-spinner fa-spin"></i>
+          <b>${esc(job.label)}</b> ${esc(job.range ?? '')} <span class="mh_tp_dim">(${Math.min(job.done + 1, job.total || 1)}/${job.total || 1})</span>
+          ${job.api ? `<br><span class="mh_tp_dim">ใช้ ${esc(job.api)}${job.attempts > 1 ? ` · API ลำดับ ${job.attempt}/${job.attempts}` : ''}</span>` : ''}
+          <a href="#" data-mh="stop" class="mh_tp_stop">หยุด</a></div>`;
+    } else {
+        jobHtml = '<div class="mh_tp_job mh_tp_dim">ไม่มีงานที่กำลังทำ</div>';
+    }
+    if (queued) jobHtml += `<div class="mh_tp_dim">รอคิวอีก ${queued} รอบ</div>`;
+    if (lastJob && !busy) jobHtml += `<div class="${lastJob.ok ? 'mh_ok' : 'mh_bad'}">${lastJob.ok ? '✔' : '✖'} ${esc(lastJob.text)} <span class="mh_tp_dim">· ${ago(lastJob.at)}</span></div>`;
+    const paused = !busy && s.autoSummarize && autoPausedUntil > len;
+    barPanel.innerHTML = `
+      <div class="mh_tp_head"><b><i class="fa-solid fa-brain"></i> Memory Hub</b> <span class="mh_tp_dim">${esc(botName())}</span>
+        <i class="fa-solid fa-xmark mh_tp_close" data-mh="close" title="ปิด"></i></div>
+      <div class="mh_tp_stat">สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> จากทั้งหมด ${len} · ยังไม่สรุป <b>${pending}</b> · ความจำ ${st.memories.length} ก้อน</div>
+      <div class="mh_tp_dim">${!s.enabled ? 'Memory Hub ปิดอยู่' : !s.autoSummarize ? 'สรุปอัตโนมัติปิดอยู่' : paused ? `สรุปอัตโนมัติพักไว้หลังล้มเหลว จนถึงข้อความ #${autoPausedUntil - 1} <a href="#" data-mh="resume">ลองตอนนี้</a>` : `สรุปอัตโนมัติรอบถัดไปเมื่อแชทถึงข้อความ #${nextAt}`}</div>
+      ${jobHtml}
+      <div class="mh_tp_btns">
+        <div class="menu_button${busy ? ' disabled' : ''}" data-mh="now"><i class="fa-solid fa-wand-magic-sparkles"></i> สรุปเดี๋ยวนี้</div>
+        <div class="menu_button${busy ? ' disabled' : ''}" data-mh="carry"><i class="fa-solid fa-forward"></i> สรุป + ขึ้นแชทใหม่</div>
+        <div class="menu_button" data-mh="open"><i class="fa-solid fa-book-open"></i> คลังความจำ</div>
+        <div class="menu_button" data-mh="last"><i class="fa-solid fa-eye"></i> ส่งอะไรไปล่าสุด</div>
+      </div>`;
+}
+
 // ---------------------------------------------------------------- init
 
 function registerCommands() {
@@ -1457,6 +1629,11 @@ jQuery(() => {
         registerCommands();
         const { eventSource, eventTypes: E } = ctx();
         eventSource.on(E.MESSAGE_RECEIVED, onMessageReceived);
+        eventSource.on(E.MESSAGE_RECEIVED, () => renderTopbar());
+        eventSource.on(E.MESSAGE_SENT, () => renderTopbar());
+        if (E.APP_READY) eventSource.on(E.APP_READY, () => renderTopbar());
+        // the Top Info Bar may load after us, or be switched on/off later
+        setInterval(() => { if (settings().topbar) renderTopbar(); }, 2000);
         eventSource.on(E.MESSAGE_DELETED, () => reconcile({ announce: true }));
         eventSource.on(E.CHAT_CHANGED, () => {
             clearPrompts();
