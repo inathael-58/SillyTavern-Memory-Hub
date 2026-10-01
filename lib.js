@@ -113,7 +113,16 @@ export function parseSummary(raw) {
         keys = k[1].split(/[,，、;|]/).map(x => x.trim().replace(/^["'`]|["'`]$/g, '')).filter(Boolean);
         body = body.replace(k[0], '');
     }
+    // "facts:" carries who-is-who and agreements; it becomes the first bullet
+    let facts = '';
+    const f = /^\s*(?:facts?|ข้อเท็จจริง)\s*[:：]\s*(.+)$/im.exec(body);
+    if (f) {
+        body = body.replace(f[0], '');
+        const v = f[1].trim();
+        if (!/^(?:none|n\/a|ไม่มี|-|—|\(none\)|<.*>)\.?$/i.test(v)) facts = v;
+    }
     body = body.replace(/^\s*(?:summary|สรุป)\s*[:：]\s*/im, '').trim();
+    if (facts) body = `- ${facts}\n${body}`.trim();
 
     return { title: title.slice(0, 120), keys: [...new Set(keys)].slice(0, 12), text: body, overview };
 }
