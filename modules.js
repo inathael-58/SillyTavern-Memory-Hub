@@ -224,6 +224,7 @@ Answer in exactly this format and nothing else:
 <memory>
 title: <short title>
 keys: <comma separated>
+facts: <who-is-who and agreements first revealed in NEW MESSAGES: family ties, occupations, origins, titles, codes or signals agreed on — or "none">
 summary:
 - ...
 </memory>{{overview_format}}`;
@@ -235,7 +236,8 @@ export function buildOverviewRule(mods) {
     if (!heads.length) {
         return '- overview: rewrite PREVIOUS OVERVIEW so it also covers the new memory. It is the story so far in at most {{overview_words}} words: who is who, where things stand, what happened that still matters, where they are now, open threads. Drop details that no longer matter, but never drop who is who (identities, disguises, who is in which body) or a secret that is still hidden.';
     }
-    const all = [...heads, 'Now: where everyone is and what is happening at this moment', 'Open threads: promises, plans and unresolved matters'];
+    const who = mods.some(m => m.id === 'ensemble') ? [] : ['Who is who: one line per important character (role, origin, occupation, family ties, current body or disguise)'];
+    const all = [...who, ...heads, 'Now: where everyone is and what is happening at this moment', 'Open threads: promises, plans and unresolved matters'];
     return `- overview: rewrite PREVIOUS OVERVIEW as the CURRENT STATE of the story, at most {{overview_words}} words in total, under these headings (skip a heading if there is nothing for it):
 ${all.map(h => `  ${h}`).join('\n')}
   Write the headings in the story's language. Drop what is resolved and no longer matters, but never drop who is who (identities, disguises, who is in which body) or a secret that is still hidden.`;
