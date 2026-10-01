@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.5.0'; // keep in sync with manifest.json
+const VERSION = '1.5.1'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -1778,7 +1778,9 @@ function ensureTopbar() {
         barPanel.addEventListener('change', e => {
             const sel = e.target.closest?.('.mh_tp_add');
             if (!sel?.value) return;
-            if (setBotModules([...resolveModules().ids, sel.value])) refreshUi();
+            const id = sel.value;
+            sel.blur(); // let the panel redraw (it waits while a list is open)
+            if (setBotModules([...resolveModules().ids, id])) refreshUi();
         });
     }
     if (barPanel.parentElement !== host.parentElement) host.after(barPanel);
@@ -1841,6 +1843,10 @@ function renderTopbar() {
 
     applyIcon(barBtn);
     if (!barPanel.classList.contains('mh_open')) return;
+    // A rebuild while the module list is open closes it (iOS shows the picker
+    // natively and drops it the moment its <select> is replaced).
+    const focused = document.activeElement;
+    if (focused?.tagName === 'SELECT' && barPanel.contains(focused)) return;
     const nextAt = st.lastEnd + s.chunkSize + s.keepRaw;
     let jobHtml;
     if (busy && job) {
@@ -1854,7 +1860,7 @@ function renderTopbar() {
     if (queued) jobHtml += `<div class="mh_tp_dim">รอคิวอีก ${queued} รอบ</div>`;
     if (lastJob && !busy) jobHtml += `<div class="${lastJob.ok ? 'mh_ok' : 'mh_bad'}">${lastJob.ok ? '✔' : '✖'} ${esc(lastJob.text)} <span class="mh_tp_dim">· ${ago(lastJob.at)}</span></div>`;
     const paused = !busy && s.autoSummarize && autoPausedUntil > len;
-    barPanel.innerHTML = `
+    const html = `
       <div class="mh_tp_head"><b><span class="mh_icon_slot"></span> Memory Hub</b> <span class="mh_tp_dim">${esc(botName())}</span>
         <i class="fa-solid fa-xmark mh_tp_close" data-mh="close" title="ปิด"></i></div>
       <div class="mh_tp_stat">สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> จากทั้งหมด ${len} · ยังไม่สรุป <b>${pending}</b> · ความจำ ${st.memories.length} ก้อน</div>
@@ -1867,6 +1873,8 @@ function renderTopbar() {
         <div class="menu_button" data-mh="open"><i class="fa-solid fa-book-open"></i> คลังความจำ</div>
         <div class="menu_button" data-mh="last"><i class="fa-solid fa-eye"></i> ส่งอะไรไปล่าสุด</div>
       </div>`;
+    // only touch the DOM when something changed (this runs every 2 s)
+    if (barPanel.dataset.html !== html) { barPanel.innerHTML = html; barPanel.dataset.html = html; }
     applyIcon(barPanel);
 }
 

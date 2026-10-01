@@ -168,10 +168,11 @@
 /* ---------------------------------------------------------------- 1.4 icons + export */
 .mh_svg { width: 1em; height: 1em; display: inline-block; vertical-align: -0.125em; }
 .mh_emoji { font-style: normal; line-height: 1; }
-.mh_icon_slot { display: inline-flex; align-items: center; justify-content: center; }
+.mh_icon_slot { display: inline-flex; align-items: center; justify-content: center; min-width: 1em; min-height: 1em; }
 #mh_topbar_btn { display: inline-flex; align-items: center; justify-content: center; }
 #mh_topbar_btn .mh_icon_slot { font-size: 1.05em; }
-#mh_topbar_btn .mh_svg { width: 1.15em; height: 1.15em; filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.25)); }
+/* no CSS filter on the SVG: iOS Safari then skips painting it until the area is tapped */
+#mh_topbar_btn .mh_svg { width: 1.15em; height: 1.15em; display: block; }
 .mh_iconrow { display: flex; align-items: flex-start; gap: 0.6em; margin: 0.2em 0 0.4em; }
 .mh_iconrow > span { padding-top: 0.35em; white-space: nowrap; }
 .mh_icons { display: flex; flex-wrap: wrap; gap: 0.25em; }
