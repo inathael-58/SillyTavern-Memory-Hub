@@ -12,7 +12,8 @@
  * @typedef {Object} PromptModule
  * @property {string} id
  * @property {string} name        Thai label for the UI
- * @property {string} [desc]      Thai one-liner for the UI
+ * @property {string} [desc]      Thai one-liner for the UI: what it remembers
+ * @property {string} [fit]       Thai: which kinds of bots it suits
  * @property {string[]} [tags]    SillyTavern tag names that switch the module on (case-insensitive)
  * @property {string[]} [keep]    bullet lines: what to remember
  * @property {string[]} [skip]    what to leave out
@@ -29,6 +30,7 @@ export const BUILTIN_MODULES = Object.freeze([
         id: 'relationship',
         name: 'ความสัมพันธ์ / โรแมนซ์',
         desc: 'ความรู้สึก ความไว้ใจ จุดเปลี่ยนของความสัมพันธ์ สิ่งที่รู้เกี่ยวกับกัน',
+        fit: 'โรแมนซ์ จีบกัน คู่รัก เพื่อนสนิท ครอบครัว — บอทที่หัวใจของเรื่องคือความสัมพันธ์ระหว่างเรากับบอท',
         tags: ['romance', 'relationship', 'love', 'โรแมนซ์', 'ความรัก', 'รัก', 'จีบ', 'dating', 'bl', 'gl', 'yaoi', 'yuri', 'otome'],
         keep: [
             'how the relationship changed: feelings, trust, attraction, jealousy, conflicts, apologies, milestones (first date, confession, first kiss…), boundaries',
@@ -44,6 +46,7 @@ export const BUILTIN_MODULES = Object.freeze([
         id: 'ensemble',
         name: 'หลายตัวละคร',
         desc: 'จำแยกทีละตัว ใครรู้สึกยังไงกับใคร ใครอยู่ที่ไหน',
+        fit: 'แชทกลุ่ม การ์ดผู้เล่าเรื่อง ฮาเร็ม หรือเรื่องที่มีตัวละครสำคัญ 3 ตัวขึ้นไป',
         tags: ['multiple characters', 'multi', 'ensemble', 'group', 'หลายตัวละคร', 'หลายคาร์', 'multichar', 'harem', 'ฮาเร็ม', 'narrator', 'ผู้เล่าเรื่อง'],
         keep: [
             'for EACH character who appears: what they did, what they now feel or want, how they changed',
@@ -59,6 +62,7 @@ export const BUILTIN_MODULES = Object.freeze([
         id: 'story',
         name: 'เนื้อเรื่อง / ดราม่า',
         desc: 'จุดหักมุม แรงจูงใจ ปมที่ยังค้าง การปูเรื่อง',
+        fit: 'แฟนตาซี ผจญภัย ดราม่า — เรื่องที่มีพล็อตหลัก มีจุดหักมุม และมีปมให้ตามต่อ',
         tags: ['story', 'plot', 'drama', 'angst', 'เนื้อเรื่อง', 'ดราม่า', 'พล็อต', 'fantasy', 'แฟนตาซี', 'adventure', 'ผจญภัย'],
         keep: [
             'turning points and their consequences; choices that cannot be undone',
@@ -73,6 +77,7 @@ export const BUILTIN_MODULES = Object.freeze([
         id: 'mystery',
         name: 'ปริศนา / ความลับ',
         desc: 'เบาะแส ผู้ต้องสงสัย ใครรู้อะไร ใครโกหก',
+        fit: 'สืบสวน ศาล สายลับ ระทึกขวัญ หรือเรื่องที่มีความลับต้องปิด (เช่น สลับร่าง ปลอมตัว)',
         tags: ['mystery', 'detective', 'secret', 'thriller', 'ปริศนา', 'สืบสวน', 'ความลับ', 'ระทึกขวัญ', 'investigation'],
         keep: [
             'clues found, by whom, and what they seem to point to',
@@ -88,6 +93,7 @@ export const BUILTIN_MODULES = Object.freeze([
         id: 'rpg',
         name: 'ระบบเกม / RPG',
         desc: 'เควส ไอเท็ม เงิน สเตตัส สกิล ปาร์ตี้',
+        fit: 'เกม อิเซไก D&D ดันเจียน — มีเควส ไอเท็ม เงิน เลเวล หรือใช้เก็บรายการหลักฐานในเรื่องสืบสวนก็ได้',
         tags: ['rpg', 'game', 'dnd', 'd&d', 'dungeon', 'isekai', 'เกม', 'อิเซไก', 'ต่างโลก', 'trpg', 'litrpg', 'system'],
         keep: [
             'quests and goals: started, advanced, completed, failed, and their rewards',
@@ -104,6 +110,7 @@ export const BUILTIN_MODULES = Object.freeze([
         id: 'world',
         name: 'โลก / การเมือง / ฝ่าย',
         desc: 'ฝ่ายต่าง ๆ การเมือง กฎของเวทมนตร์หรือเทคโนโลยี ประวัติศาสตร์',
+        fit: 'โลกแฟนตาซีหรือไซไฟที่มีอาณาจักร ฝ่าย การเมือง ระบบเวทมนตร์ หรือประวัติศาสตร์ของโลก',
         tags: ['worldbuilding', 'world', 'politics', 'kingdom', 'faction', 'war', 'โลก', 'การเมือง', 'อาณาจักร', 'สงคราม', 'sci-fi', 'ไซไฟ', 'magic', 'เวทมนตร์'],
         keep: [
             'factions, rulers and organisations: who they are, what they want, how they stand towards {{user}}',
@@ -119,6 +126,7 @@ export const BUILTIN_MODULES = Object.freeze([
         id: 'daily',
         name: 'ชีวิตประจำวัน',
         desc: 'กิจวัตร ตารางเวลา นัดหมาย ความชอบเล็ก ๆ น้อย ๆ',
+        fit: 'ชีวิตประจำวัน โรงเรียน ออฟฟิศ รูมเมท — เรื่องที่ไม่มีพล็อตใหญ่ เน้นกิจวัตรกับนัดหมาย',
         tags: ['slice of life', 'slice-of-life', 'daily', 'sol', 'school', 'office', 'ชีวิตประจำวัน', 'โรงเรียน', 'ออฟฟิศ', 'ครอบครัว', 'family', 'roommate', 'รูมเมท'],
         keep: [
             'routines, schedules, appointments and plans for later',
@@ -133,6 +141,7 @@ export const BUILTIN_MODULES = Object.freeze([
         id: 'survival',
         name: 'เอาชีวิตรอด / สยองขวัญ',
         desc: 'บาดแผล ทรัพยากร ภัยคุกคาม ใครตาย ใครหาย',
+        fit: 'สยองขวัญ ซอมบี้ วันสิ้นโลก เอาชีวิตรอด — ต้องนับเสบียง บาดแผล และใครยังรอดอยู่',
         tags: ['horror', 'survival', 'zombie', 'apocalypse', 'สยองขวัญ', 'เอาชีวิตรอด', 'ซอมบี้', 'วันสิ้นโลก', 'ผี'],
         keep: [
             'injuries, illness and physical or mental state of each character',
@@ -148,6 +157,7 @@ export const BUILTIN_MODULES = Object.freeze([
         id: 'time',
         name: 'เวลาในเรื่อง',
         desc: 'วัน เวลา ฤดู การข้ามเวลา เส้นตาย อายุ',
+        fit: 'เรื่องที่วันเวลาสำคัญ เช่น มีเส้นตาย นับถอยหลัง ข้ามเวลา หรือย้อนเวลา',
         tags: ['timeline', 'time', 'เวลา', 'ไทม์ไลน์', 'time travel', 'ย้อนเวลา'],
         keep: ['in-story date and time, time skips, deadlines and countdowns, ages'],
         keys: 'dates, deadlines, events on the calendar',
@@ -159,6 +169,7 @@ export const BUILTIN_MODULES = Object.freeze([
         id: 'stats',
         name: 'แผงสเตตัส / ค่าความชอบ',
         desc: 'บอทที่มีแผงสถานะ ค่าความชอบ ค่าความสัมพันธ์ในข้อความ',
+        fit: 'บอทที่มีแผงสถานะหรือค่าความชอบท้ายข้อความ — จำเฉพาะค่าล่าสุด ไม่ต้องจำตัวแผง',
         tags: ['status', 'stat', 'status panel', 'affection', 'สเตตัส', 'ค่าความชอบ', 'แผงสถานะ', 'dating sim'],
         keep: ['numbers shown in status panels (affection, trust, HP, money…): only the final values at the end of these messages and what made them change a lot'],
         skip: ['the status panels themselves and their decoration'],

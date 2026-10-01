@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.4.3'; // keep in sync with manifest.json
+const VERSION = '1.5.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -273,6 +273,21 @@ function resolveModules() {
     const def = Array.isArray(s.defaultModules) ? s.defaultModules : (isGroup() ? ['ensemble', 'story'] : ['relationship']);
     return { ids: def.filter(id => known.has(id)), from: 'default' };
 }
+/** Sets this bot's own module list (kept in module order). */
+function setBotModules(ids) {
+    const key = botKey();
+    if (!key) { toast.warn('เปิดแชทก่อน'); return false; }
+    const want = new Set(ids);
+    settings().botModules[key] = moduleList().map(m => m.id).filter(id => want.has(id));
+    saveSettings();
+    return true;
+}
+const MOD_FROM_TH = { bot: 'เลือกเอง', tags: 'จากแท็ก', default: 'ค่าเริ่มต้น' };
+/** Tooltip text: what it remembers, which bots it suits, which tags switch it on. */
+function moduleTip(m) {
+    return [m.name, m.desc && `จำ: ${m.desc}`, m.fit && `เหมาะกับ: ${m.fit}`, m.tags?.length && `แท็กที่เปิดเอง: ${m.tags.join(', ')}`].filter(Boolean).join('\n');
+}
+
 function activeModules() {
     const ids = new Set(resolveModules().ids);
     return moduleList().filter(m => ids.has(m.id));
@@ -1153,6 +1168,7 @@ function renderSettings() {
             <div class="mh_modhead"><b>โมดูลของบอทนี้:</b> <span id="mh_botname"></span></div>
             <small id="mh_modsrc" class="mh_hint"></small>
             <div id="mh_mods" class="mh_mods"></div>
+            <div id="mh_modinfo" class="mh_modinfo">ชี้หรือแตะที่โมดูลเพื่อดูว่าเหมาะกับแนวไหน</div>
             <div class="mh_btns">
               <div class="menu_button" id="mh_mod_reset" title="เลิกใช้ที่เลือกเองของบอทนี้ กลับไปใช้แท็กหรือค่าเริ่มต้น"><i class="fa-solid fa-rotate-left"></i> กลับไปใช้แท็ก/ค่าเริ่มต้น</div>
               <div class="menu_button" id="mh_mod_setdef" title="บอทที่ยังไม่ได้เลือกและไม่มีแท็กที่ตรง จะใช้ชุดนี้"><i class="fa-solid fa-star"></i> ตั้งชุดนี้เป็นค่าเริ่มต้น</div>
@@ -1253,13 +1269,13 @@ function renderSettings() {
     $('#mh_prompt_from_mods').on('click', () => { s.prompt = buildPrompt(activeModules(), { group: isGroup() }); $('#mh_prompt').val(s.prompt); saveSettings(); });
     bindCheck('#mh_autowords', 'autoWords');
     $('#mh_mods').on('change', 'input[type=checkbox]', function () {
-        const key = botKey();
-        if (!key) return toast.warn('เปิดแชทก่อน');
         const ids = new Set(resolveModules().ids);
         if (this.checked) ids.add(this.value); else ids.delete(this.value);
-        // keep the list in module order
-        s.botModules[key] = moduleList().map(m => m.id).filter(id => ids.has(id));
-        saveSettings(); refreshUi();
+        setBotModules(ids);
+        showModuleInfo(this.value);
+        refreshUi();
+    }).on('pointerenter focusin', '.mh_mod', function () {
+        showModuleInfo(this.querySelector('input')?.value);
     });
     $('#mh_mod_reset').on('click', () => { const key = botKey(); if (key) delete s.botModules[key]; saveSettings(); refreshUi(); });
     $('#mh_mod_setdef').on('click', () => { s.defaultModules = [...resolveModules().ids]; saveSettings(); refreshUi(); toast.ok('ตั้งเป็นค่าเริ่มต้นแล้ว'); });
@@ -1324,13 +1340,22 @@ function renderModulePicker() {
     $('#mh_modsrc').text(src);
     const on = new Set(r.ids);
     $('#mh_mods').html(moduleList().map(m => `
-      <label class="mh_mod${on.has(m.id) ? ' mh_on' : ''}" title="${esc(m.desc ?? '')}${m.tags?.length ? `\nแท็กที่เปิดโมดูลนี้: ${esc(m.tags.join(', '))}` : ''}">
+      <label class="mh_mod${on.has(m.id) ? ' mh_on' : ''}" title="${esc(moduleTip(m))}">
         <input type="checkbox" value="${esc(m.id)}"${on.has(m.id) ? ' checked' : ''}${key ? '' : ' disabled'}>
         <span>${esc(m.name)}${m.custom ? ' <i class="fa-solid fa-pen-nib" title="โมดูลของเรา"></i>' : ''}</span>
       </label>`).join(''));
     $('#mh_mod_reset').toggleClass('disabled', r.from !== 'bot');
     const w = wordBudget();
     $('#mh_words_now').text(`บอทนี้: ความจำ ≤ ${w.memory} คำ · เรื่องย่อ ≤ ${w.overview} คำ · response ${w.response} โทเคน`);
+}
+
+/** The line under the module chips: works on phones, where tooltips do not. */
+function showModuleInfo(id) {
+    const m = moduleList().find(x => x.id === id);
+    const el = document.getElementById('mh_modinfo');
+    if (!el) return;
+    if (!m) { el.innerHTML = 'ชี้หรือแตะที่โมดูลเพื่อดูว่าเหมาะกับแนวไหน'; return; }
+    el.innerHTML = `<b>${esc(m.name)}</b>${m.desc ? `<br>จำ: ${esc(m.desc)}` : ''}${m.fit ? `<br>เหมาะกับ: ${esc(m.fit)}` : ''}${m.tags?.length ? `<br><span class="mh_tp_dim">แท็กที่เปิดเอง: ${esc(m.tags.slice(0, 8).join(', '))}${m.tags.length > 8 ? ' …' : ''}</span>` : ''}`;
 }
 
 async function previewPrompt() {
@@ -1408,7 +1433,8 @@ function moduleEditor(m, editable) {
             : '<div class="menu_button mh_mod_copy" title="ทำสำเนามาแก้ ฉบับของเราจะใช้แทนของในตัว">แก้ไข</div>'}
       </div>
       ${builtinOverride ? '<small class="mh_hint">ฉบับแก้ของโมดูลในตัว (ลบเพื่อกลับไปใช้ของเดิม)</small>' : ''}
-      <label>คำอธิบาย</label><input class="text_pole" data-f="desc" value="${esc(m.desc ?? '')}"${ro}>
+      <label>จำอะไร (คำอธิบายสั้น ๆ)</label><input class="text_pole" data-f="desc" value="${esc(m.desc ?? '')}"${ro}>
+      <label>เหมาะกับบอทแนวไหน</label><input class="text_pole" data-f="fit" value="${esc(m.fit ?? '')}"${ro}>
       <label>แท็กที่เปิดโมดูลนี้ (คั่นด้วย ,)</label><input class="text_pole" data-f="tags" value="${esc((m.tags ?? []).join(', '))}"${ro}>
       <label>สิ่งที่ต้องจำ (บรรทัดละข้อ)</label><textarea class="text_pole" data-f="keep" rows="3"${ro}>${esc((m.keep ?? []).join('\n'))}</textarea>
       <label>สิ่งที่ไม่ต้องจำ (บรรทัดละข้อ)</label><textarea class="text_pole" data-f="skip" rows="1"${ro}>${esc((m.skip ?? []).join('\n'))}</textarea>
@@ -1749,6 +1775,11 @@ function ensureTopbar() {
         barPanel = document.createElement('div');
         barPanel.id = 'mh_topbar_panel';
         barPanel.addEventListener('click', onTopbarClick);
+        barPanel.addEventListener('change', e => {
+            const sel = e.target.closest?.('.mh_tp_add');
+            if (!sel?.value) return;
+            if (setBotModules([...resolveModules().ids, sel.value])) refreshUi();
+        });
     }
     if (barPanel.parentElement !== host.parentElement) host.after(barPanel);
     return true;
@@ -1767,7 +1798,21 @@ async function onTopbarClick(e) {
     else if (a === 'last') await showLastInjection();
     else if (a === 'stop') { cancelRequested = true; toast.info('จะหยุดหลังก้อนที่กำลังทำเสร็จ'); }
     else if (a === 'resume') { autoPausedUntil = 0; onMessageReceived(null, 'normal'); }
+    else if (a === 'mod-del') {
+        const id = t.closest('[data-id]')?.dataset.id;
+        if (setBotModules(resolveModules().ids.filter(x => x !== id))) refreshUi();
+    }
     renderTopbar();
+}
+
+function topbarModulesHtml() {
+    const r = resolveModules();
+    const on = new Set(r.ids);
+    const mods = moduleList();
+    const chips = mods.filter(m => on.has(m.id)).map(m => `<span class="mh_tp_chip" title="${esc(moduleTip(m))}">${esc(m.name)}<i class="fa-solid fa-xmark" data-mh="mod-del" data-id="${esc(m.id)}" title="เอาออก"></i></span>`).join('');
+    const rest = mods.filter(m => !on.has(m.id));
+    const add = rest.length ? `<select class="mh_tp_add" title="เพิ่มโมดูล"><option value="">＋ เพิ่ม</option>${rest.map(m => `<option value="${esc(m.id)}" title="${esc(moduleTip(m))}">${esc(m.name)}</option>`).join('')}</select>` : '';
+    return `<div class="mh_tp_mods"><span class="mh_tp_dim">โมดูล (${MOD_FROM_TH[r.from] ?? r.from}):</span> ${chips || '<span class="mh_tp_dim">พื้นฐานอย่างเดียว</span>'} ${add}</div>`;
 }
 
 const ago = ts => {
@@ -1813,6 +1858,7 @@ function renderTopbar() {
       <div class="mh_tp_head"><b><span class="mh_icon_slot"></span> Memory Hub</b> <span class="mh_tp_dim">${esc(botName())}</span>
         <i class="fa-solid fa-xmark mh_tp_close" data-mh="close" title="ปิด"></i></div>
       <div class="mh_tp_stat">สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> จากทั้งหมด ${len} · ยังไม่สรุป <b>${pending}</b> · ความจำ ${st.memories.length} ก้อน</div>
+      ${s.style === 'custom' ? '<div class="mh_tp_dim">Prompt สรุป: เขียนเองทั้งหมด</div>' : topbarModulesHtml()}
       <div class="mh_tp_dim">${!s.enabled ? 'Memory Hub ปิดอยู่' : !s.autoSummarize ? 'สรุปอัตโนมัติปิดอยู่' : paused ? `สรุปอัตโนมัติพักไว้หลังล้มเหลว จนถึงข้อความ #${autoPausedUntil - 1} <a href="#" data-mh="resume">ลองตอนนี้</a>` : `สรุปอัตโนมัติรอบถัดไปเมื่อแชทถึงข้อความ #${nextAt}`}</div>
       ${jobHtml}
       <div class="mh_tp_btns">

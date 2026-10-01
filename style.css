@@ -184,3 +184,17 @@
 .mh_export { text-align: left; }
 .mh_import .mh_file_btn { margin: 0.2em 0 0.4em; }
 .mh_card .mh_trunc { font-size: 0.8em; color: #f5a524; white-space: nowrap; }
+
+/* ---------------------------------------------------------------- 1.5 module tips + top bar modules */
+.mh_modinfo { font-size: 0.85em; opacity: 0.85; min-height: 2.6em; padding: 0.3em 0.5em; border-left: 2px solid var(--SmartThemeQuoteColor, #e18a24); margin-bottom: 0.4em; line-height: 1.45; }
+.mh_modinfo .mh_tp_dim { opacity: 0.7; }
+#mh_topbar_panel .mh_tp_mods { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3em; margin: 0.25em 0; }
+#mh_topbar_panel .mh_tp_chip {
+    display: inline-flex; align-items: center; gap: 0.35em;
+    padding: 0.05em 0.5em; border-radius: 999px; font-size: 0.9em;
+    border: 1px solid var(--SmartThemeQuoteColor, #e18a24);
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #e18a24) 15%, transparent);
+}
+#mh_topbar_panel .mh_tp_chip i { cursor: pointer; opacity: 0.6; font-size: 0.85em; }
+#mh_topbar_panel .mh_tp_chip i:hover { opacity: 1; }
+#mh_topbar_panel .mh_tp_add { width: auto; max-width: 7.5em; flex: 0 0 auto; margin: 0; padding: 0.05em 0.4em; font-size: 0.9em; border-radius: 999px; min-height: 0; height: auto; }
