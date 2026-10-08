@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.5.2'; // keep in sync with manifest.json
+const VERSION = '1.6.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -91,8 +91,10 @@ Answer in exactly this format and nothing else:
 
 const DEFAULTS = Object.freeze({
     enabled: true,
-    autoSummarize: true,
+    mode: 'auto',           // auto | semi (ask first) | manual
     chunkSize: 20,          // messages per memory
+    semiSnooze: 10,         // semi: ask again after this many more messages
+    quotaBoost: 1,          // multiplies memory length and recall budget
     keepRaw: 12,            // newest messages that are never summarized yet
     trimSummarized: true,   // drop summarized messages from the prompt
     overviewEnabled: true,
@@ -186,6 +188,9 @@ function settings() {
         if (s.responseLength === 1200) s.responseLength = 800;
     }
     if (s.style === 'auto') s.style = 'modules';
+    // migrate 1.5.x: the on/off switch became a mode
+    if (s.mode == null && s.autoSummarize === false) s.mode = 'manual';
+    delete s.autoSummarize;
     for (const [k, v] of Object.entries(DEFAULTS)) if (s[k] === undefined || (k === 'sources' && s[k] == null)) s[k] = v ?? ['main'];
     if (!Array.isArray(s.sources) || !s.sources.length) s.sources = ['main'];
     return s;
@@ -292,19 +297,22 @@ function activeModules() {
     const ids = new Set(resolveModules().ids);
     return moduleList().filter(m => ids.has(m.id));
 }
-function wordBudget() {
+function wordBudget({ boost } = {}) {
     const s = settings();
     const extra = s.autoWords ? extraWords(activeModules()) : { memory: 0, overview: 0 };
-    const memory = s.memoryWords + extra.memory;
+    // more messages per memory need longer memories; the default chunk is the baseline
+    const per = s.autoWords ? Math.max(1, s.chunkSize / DEFAULTS.chunkSize) : 1;
+    const scale = per * (boost ?? (Number(s.quotaBoost) || 1));
+    const memory = Math.round((s.memoryWords + extra.memory) * scale);
     const overview = s.overviewWords + extra.overview;
     // Thai runs 3-5 tokens a word and "thinking" models spend part of the budget
     // on reasoning; the limit only caps the answer, it costs nothing unused
     const response = Math.max(s.responseLength, Math.ceil((memory + (s.overviewEnabled ? overview : 0)) * 5 + 400));
     // models cannot count Thai words, so the length is also given as a number of bullets
-    const bullets = Math.min(10, Math.max(4, Math.round(memory / 22)));
+    const bullets = Math.min(Math.round(10 * Math.max(1, scale)), Math.max(4, Math.round(memory / 22)));
     // longer memories need a bigger recall budget to fit the same number of them
     const recall = Math.round(s.recallBudget * memory / Math.max(1, s.memoryWords));
-    return { memory, overview, response, bullets, recall };
+    return { memory, overview, response, bullets, recall, per };
 }
 
 // ---------------------------------------------------------------- model calls (with fallback chain)
@@ -558,13 +566,98 @@ function runSummaries({ force = false, quiet = false, keepRaw = null } = {}) {
 
 function onMessageReceived(_id, type) {
     const s = settings();
-    if (!s.enabled || !s.autoSummarize || type === 'quiet') return;
+    if (!s.enabled || type === 'quiet') return;
     const st = state();
     if (!st) return;
     const len = ctx().chat.length;
+    if (s.mode === 'manual') return warnBacklog(st, len);
     if (len < autoPausedUntil) return;
     if (!nextChunk(st.lastEnd, len, s.chunkSize, s.keepRaw)) return;
+    if (s.mode === 'semi') return askToSummarize(st, len);
     runSummaries({ quiet: true });
+}
+
+const MODE_TH = { auto: 'อัตโนมัติ', semi: 'กึ่งอัตโนมัติ', manual: 'สรุปเอง (Manual)' };
+const pendingOf = (st, len) => Math.max(0, len - 1 - st.lastEnd);
+/** Unsummarized messages worth a warning when nothing summarizes them on its own. */
+const backlogAt = s => Math.max(40, s.chunkSize * 2);
+function hasBacklog(s, st, len) {
+    return s.enabled && s.mode !== 'auto' && pendingOf(st, len) >= backlogAt(s);
+}
+
+let backlogWarned = 0; // pending count at the last manual-mode warning
+function warnBacklog(st, len) {
+    const s = settings();
+    const pending = pendingOf(st, len);
+    if (pending < backlogWarned) backlogWarned = 0;
+    if (!hasBacklog(s, st, len) || (backlogWarned && pending < backlogWarned + s.chunkSize)) return;
+    backlogWarned = pending;
+    toast.warn(`ยังไม่ได้สรุป ${pending} ข้อความ ข้อความเหล่านี้ถูกส่งเต็มทุกเทิร์น ยิ่งค้างยิ่งเปลืองโทเคน และถ้าเกิน context ข้อความเก่าสุดจะหลุดไปโดยยังไม่ถูกจำ\nแตะที่นี่เพื่อสรุปเลย`,
+        { timeOut: 15000, onclick: () => summarizeNow() });
+}
+
+let asking = false;
+/** Semi-auto: the chunk is due, ask before summarizing. */
+async function askToSummarize(st, len) {
+    if (asking || busy || len < (st.remindAt ?? 0)) return;
+    asking = true;
+    try {
+        const s = settings();
+        const c = ctx();
+        const chatId = c.chatId;
+        const box = document.createElement('div');
+        box.className = 'mh_carry';
+        box.innerHTML = `
+          <h3>ถึงรอบสรุปแล้ว</h3>
+          <p>ยังไม่สรุป <b>${pendingOf(st, len)}</b> ข้อความ สรุปตอนนี้จะได้ความจำ ${plannedChunks(false, null)} ก้อน (ก้อนละ ${s.chunkSize} ข้อความ) สรุปเลยไหม?</p>
+          <label class="mh_row"><span>ถ้ายังไม่สรุป ถามอีกครั้งในอีก (ข้อความ)</span><input type="number" class="text_pole mh_snooze_in" min="1" max="200"></label>
+          <small>ระหว่างที่ยังไม่สรุป ข้อความเหล่านี้ถูกส่งแบบเต็มทุกเทิร์น</small>`;
+        const input = box.querySelector('.mh_snooze_in');
+        input.value = s.semiSnooze;
+        const ok = await c.callGenericPopup(box, c.POPUP_TYPE.CONFIRM, '', { okButton: 'สรุปเลย', cancelButton: 'ยังก่อน' });
+        if (ctx().chatId !== chatId) return;
+        if (ok) {
+            delete st.remindAt; saveState();
+            await runSummaries({});
+        } else {
+            s.semiSnooze = clampInt(input.value, 1, 200, DEFAULTS.semiSnooze); saveSettings();
+            st.remindAt = ctx().chat.length + s.semiSnooze; saveState();
+            toast.info(`จะถามอีกครั้งในอีก ${s.semiSnooze} ข้อความ หรือกด "สรุปเดี๋ยวนี้" เมื่อไหร่ก็ได้`);
+        }
+    } finally {
+        asking = false;
+        refreshUi();
+    }
+}
+
+/** Switching to manual: explain what piling up messages costs, offer a bigger quota. */
+async function confirmManual() {
+    const s = settings();
+    const c = ctx();
+    const opts = [1, 1.5, 2, 3].map(b => {
+        const w = wordBudget({ boost: b });
+        return `<label class="checkbox_label"><input type="radio" name="mh_boost_pick" value="${b}"${b === (Number(s.quotaBoost) || 1) ? ' checked' : ''}>
+          ${b === 1 ? 'คงเดิม' : `เพิ่ม ×${b}`} — ความจำก้อนละ ≤ ${w.memory} คำ · งบความจำที่ดึง ${w.recall} โทเคน</label>`;
+    }).join('');
+    const box = document.createElement('div');
+    box.className = 'mh_carry';
+    box.innerHTML = `
+      <h3>โหมดสรุปเอง (Manual)</h3>
+      <p>Memory Hub จะไม่สรุปเอง ต้องกด "สรุปเดี๋ยวนี้" เอง ถ้าปล่อยให้ค้างทีละเยอะ ๆ จะมีผลแบบนี้</p>
+      <ul>
+        <li>ข้อความที่ยังไม่สรุปถูกส่งแบบเต็มทุกเทิร์น ยิ่งค้างมาก ยิ่งเปลืองโทเคนต่อเทิร์น</li>
+        <li>ถ้าค้างจนเกิน context ของโมเดล SillyTavern จะตัดข้อความเก่าสุดออกจาก prompt บอทจะลืมช่วงนั้นไปจนกว่าจะสรุป</li>
+        <li>กดสรุปทีเดียวหลายร้อยข้อความ จะเรียก API หลายรอบติดกัน (ก้อนละ ${s.chunkSize} ข้อความ) ใช้เวลานาน และอาจชนโควต้าของ API ฟรี</li>
+        <li>ถ้าตั้งให้ความจำหนึ่งก้อนครอบคลุมข้อความเยอะ รายละเอียดเล็ก ๆ จะหายมากขึ้น</li>
+      </ul>
+      <p><b>จะเพิ่มโควต้าโทเคนไหม?</b> ความจำแต่ละก้อนจะยาวและละเอียดขึ้น และงบความจำที่ดึงขยายตาม (ดึงได้จำนวนก้อนเท่าเดิม) แต่ prompt ทุกเทิร์นจะยาวขึ้น</p>
+      ${opts}
+      <small>เมื่อค้างเกิน ${backlogAt(s)} ข้อความ จะมีแจ้งเตือน เปลี่ยนตัวคูณได้ภายหลังในหัวข้อ "จังหวะการสรุป"</small>`;
+    const ok = await c.callGenericPopup(box, c.POPUP_TYPE.CONFIRM, '', { okButton: 'ใช้โหมด Manual', cancelButton: 'ยกเลิก' });
+    if (!ok) return false;
+    const pick = Number(box.querySelector('input[name=mh_boost_pick]:checked')?.value);
+    if (pick) s.quotaBoost = pick;
+    return true;
 }
 
 /**
@@ -1053,6 +1146,8 @@ async function buildExport({ withSource = false } = {}) {
             responseLength: w.response,
             chunkSize: s.chunkSize,
             keepRaw: s.keepRaw,
+            mode: s.mode,
+            quotaBoost: s.quotaBoost,
             text: fill(summaryTemplate(), s.overviewEnabled),
         },
         recall: { topK: s.topK, budget: wordBudget().recall, queryDepth: s.queryDepth, lastInjection },
@@ -1153,7 +1248,13 @@ function renderSettings() {
           <div id="mh_warn" class="mh_warn"></div>
 
           <label class="checkbox_label"><input type="checkbox" id="mh_enabled"> เปิดใช้งาน</label>
-          <label class="checkbox_label"><input type="checkbox" id="mh_auto"> สรุปอัตโนมัติเมื่อข้อความครบรอบ</label>
+          <label class="mh_row"><span>การสรุป</span>
+            <select id="mh_mode" class="text_pole">
+              <option value="auto">อัตโนมัติ (Automatic)</option>
+              <option value="semi">กึ่งอัตโนมัติ (Semi-auto) — ถามก่อน</option>
+              <option value="manual">สรุปเอง (Manual)</option>
+            </select></label>
+          <small id="mh_mode_hint" class="mh_hint"></small>
           <label class="checkbox_label" title="ข้อความที่สรุปแล้วจะไม่ถูกส่งซ้ำ ประหยัดที่สุด แชทจริงไม่ถูกลบหรือซ่อน"><input type="checkbox" id="mh_trim"> ไม่ส่งข้อความที่สรุปแล้ว (ประหยัดโทเคนมากที่สุด)</label>
           <label class="checkbox_label"><input type="checkbox" id="mh_overview"> มี "เรื่องย่อจนถึงตอนนี้" หนึ่งก้อน</label>
           <label class="checkbox_label"><input type="checkbox" id="mh_latest"> ใส่ความจำก้อนล่าสุดเสมอ (ต่อเนื่องกับข้อความดิบ)</label>
@@ -1179,12 +1280,15 @@ function renderSettings() {
               <div class="menu_button" id="mh_mod_preview"><i class="fa-solid fa-eye"></i> ดู prompt ที่ประกอบแล้ว</div>
               <div class="menu_button" id="mh_mod_manage"><i class="fa-solid fa-puzzle-piece"></i> จัดการโมดูล / สร้างเอง</div>
             </div>
-            <label class="checkbox_label"><input type="checkbox" id="mh_autowords"> ขยายความยาวความจำ เรื่องย่อ และงบความจำที่ดึง ตามโมดูลอัตโนมัติ</label>
+            <label class="checkbox_label"><input type="checkbox" id="mh_autowords"> ขยายความยาวความจำ เรื่องย่อ และงบความจำที่ดึง ตามโมดูลและจำนวนข้อความต่อก้อนอัตโนมัติ</label>
             <small id="mh_words_now" class="mh_hint"></small>
           </div>
 
           <h4>จังหวะการสรุป</h4>
-          ${numberRow('mh_chunk', 'สรุปทีละ (ข้อความ)', 'ทุก ๆ กี่ข้อความถึงจะสรุปหนึ่งครั้ง ยิ่งมากยิ่งเรียก API น้อย', 4, 200)}
+          ${numberRow('mh_chunk', 'สรุปทุก ๆ (ข้อความ)', 'ข้อความต่อความจำหนึ่งก้อน ยิ่งมากยิ่งเรียก API น้อย ความจำแต่ละก้อนยาวขึ้นตาม', 4, 200)}
+          ${numberRow('mh_snooze', 'ถ้ายังไม่สรุป ถามอีกครั้งในอีก (ข้อความ)', 'ค่าเริ่มต้นในหน้าต่างที่ถามก่อนสรุป', 1, 200)}
+          <label class="mh_row" title="คูณความยาวความจำแต่ละก้อนและงบความจำที่ดึง ใช้เมื่อความจำก้อนหนึ่งครอบคลุมข้อความเยอะ หรืออยากได้ละเอียดขึ้น"><span>ตัวคูณโควต้าความจำ</span>
+            <select id="mh_boost" class="text_pole"><option value="1">ปกติ ×1</option><option value="1.5">×1.5</option><option value="2">×2</option><option value="3">×3</option></select></label>
           ${numberRow('mh_keep', 'เก็บข้อความล่าสุดแบบเต็ม', 'ข้อความใหม่สุดกี่ข้อความที่จะยังไม่ถูกสรุป และส่งแบบเต็มเสมอ', 2, 200)}
           ${numberRow('mh_memwords', 'ความยาวความจำ (คำ)', 'ความยาวสูงสุดของความจำแต่ละก้อน', 30, 600)}
           ${numberRow('mh_ovwords', 'ความยาวเรื่องย่อ (คำ)', 'ความยาวสูงสุดของเรื่องย่อจนถึงตอนนี้', 50, 1500)}
@@ -1237,7 +1341,13 @@ function renderSettings() {
     const bindVal = (id, key) => $(id).val(s[key]).on('change input', function () { s[key] = this.value; saveSettings(); refreshUi(); });
 
     bindCheck('#mh_enabled', 'enabled');
-    bindCheck('#mh_auto', 'autoSummarize');
+    $('#mh_mode').val(s.mode).on('change', async function () {
+        const mode = this.value;
+        if (mode === 'manual' && s.mode !== 'manual' && !(await confirmManual())) { this.value = s.mode; return; }
+        s.mode = mode;
+        saveSettings(); refreshUi();
+    });
+    $('#mh_boost').val(String(s.quotaBoost)).on('change', function () { s.quotaBoost = Number(this.value) || 1; saveSettings(); refreshUi(); });
     bindCheck('#mh_trim', 'trimSummarized');
     bindCheck('#mh_overview', 'overviewEnabled');
     bindCheck('#mh_latest', 'includeLatest');
@@ -1248,6 +1358,7 @@ function renderSettings() {
         .on('click', '.mh_iconpick', function () { s.icon = this.dataset.icon; saveSettings(); applyIcon(); });
     bindNum('#mh_chunk', 'chunkSize', 4, 200);
     bindNum('#mh_keep', 'keepRaw', 2, 200);
+    bindNum('#mh_snooze', 'semiSnooze', 1, 200);
     bindNum('#mh_memwords', 'memoryWords', 30, 600);
     bindNum('#mh_ovwords', 'overviewWords', 50, 1500);
     bindNum('#mh_resp', 'responseLength', 200, 8000);
@@ -1350,7 +1461,7 @@ function renderModulePicker() {
       </label>`).join(''));
     $('#mh_mod_reset').toggleClass('disabled', r.from !== 'bot');
     const w = wordBudget();
-    $('#mh_words_now').text(`บอทนี้: ความจำ ≤ ${w.memory} คำ · เรื่องย่อ ≤ ${w.overview} คำ · response ${w.response} โทเคน · งบความจำที่ดึง ${w.recall} โทเคน`);
+    $('#mh_words_now').text(`บอทนี้ (ก้อนละ ${settings().chunkSize} ข้อความ): ความจำ ≤ ${w.memory} คำ · เรื่องย่อ ≤ ${w.overview} คำ · response ${w.response} โทเคน · งบความจำที่ดึง ${w.recall} โทเคน`);
 }
 
 /** The line under the module chips: works on phones, where tooltips do not. */
@@ -1456,6 +1567,15 @@ function refreshUi() {
     $('#mh_ovdepth').closest('.mh_row').toggle(s.overviewPosition === 'chat');
     $('#mh_recdepth').closest('.mh_row').toggle(s.recallPosition === 'chat');
     $('#mh_prompt_box').toggle(s.style === 'custom');
+    $('#mh_mode').val(s.mode);
+    $('#mh_boost').val(String(s.quotaBoost));
+    $('#mh_mode_hint').text({
+        auto: `สรุปเองทุก ๆ ${s.chunkSize} ข้อความ`,
+        semi: `ทุก ๆ ${s.chunkSize} ข้อความจะขึ้นหน้าต่างถามก่อนสรุป`,
+        manual: 'ไม่สรุปเอง กด "สรุปตอนนี้" เมื่อต้องการ (จะเตือนเมื่อค้างเยอะ)',
+    }[s.mode] ?? '');
+    $('#mh_chunk').siblings('span').text(s.mode === 'manual' ? 'ข้อความต่อความจำหนึ่งก้อน' : s.mode === 'semi' ? 'ถามทุก ๆ (ข้อความ)' : 'สรุปทุก ๆ (ข้อความ)');
+    $('#mh_snooze').closest('.mh_row').toggle(s.mode === 'semi');
     renderModulePicker();
 
     let status;
@@ -1485,6 +1605,7 @@ function refreshUi() {
     if (!hasSegmenter()) warns.push('เบราว์เซอร์นี้ไม่มีตัวตัดคำ (Intl.Segmenter) จะใช้วิธีสำรองซึ่งแม่นน้อยกว่า');
     const missing = s.sources.filter(id => id !== 'main' && !profiles().some(p => p.id === id));
     if (missing.length) warns.push(`มี Connection Profile ในรายการ API ที่หาไม่เจอ ${missing.length} อัน (จะถูกข้าม)`);
+    if (st && hasBacklog(s, st, c.chat.length)) warns.push(`ยังไม่สรุป ${pendingOf(st, c.chat.length)} ข้อความ (โหมด${MODE_TH[s.mode]}) ข้อความเหล่านี้ถูกส่งเต็มทุกเทิร์น กด "สรุปตอนนี้" เพื่อประหยัดโทเคนและไม่ให้ข้อความเก่าหลุดจาก context`);
     $('#mh_warn').html(warns.map(w => `<div><i class="fa-solid fa-triangle-exclamation"></i> ${esc(w)}</div>`).join(''));
 
     if (managerEl?.isConnected) renderManagerHeader();
@@ -1840,8 +1961,9 @@ function renderTopbar() {
     const len = ctx().chat.length;
     const pending = Math.max(0, len - 1 - st.lastEnd);
     const failed = lastJob && !lastJob.ok && !busy;
+    const backlog = hasBacklog(s, st, len);
     badge.textContent = busy && job ? `${Math.min(job.done + 1, job.total || 1)}/${job.total || 1}` : (st.lastEnd >= 0 ? `#${st.lastEnd}` : '');
-    badge.classList.toggle('mh_bad', !!failed);
+    badge.classList.toggle('mh_bad', !!failed || backlog);
     barBtn.title = busy ? `Memory Hub: ${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `Memory Hub: สรุปแล้วถึงข้อความ #${st.lastEnd} · ยังไม่สรุป ${pending}`;
     if (ownBar) ownBar.querySelector('.mh_ownbar_text').textContent = busy ? `${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `สรุปถึง #${st.lastEnd} · ค้าง ${pending}`;
 
@@ -1863,13 +1985,19 @@ function renderTopbar() {
     }
     if (queued) jobHtml += `<div class="mh_tp_dim">รอคิวอีก ${queued} รอบ</div>`;
     if (lastJob && !busy) jobHtml += `<div class="${lastJob.ok ? 'mh_ok' : 'mh_bad'}">${lastJob.ok ? '✔' : '✖'} ${esc(lastJob.text)} <span class="mh_tp_dim">· ${ago(lastJob.at)}</span></div>`;
-    const paused = !busy && s.autoSummarize && autoPausedUntil > len;
+    const paused = !busy && s.mode !== 'manual' && autoPausedUntil > len;
+    const modeLine = !s.enabled ? 'Memory Hub ปิดอยู่'
+        : paused ? `สรุปอัตโนมัติพักไว้หลังล้มเหลว จนถึงข้อความ #${autoPausedUntil - 1} <a href="#" data-mh="resume">ลองตอนนี้</a>`
+        : s.mode === 'manual' ? 'โหมดสรุปเอง: กด "สรุปเดี๋ยวนี้" เมื่อต้องการ'
+        : s.mode === 'semi' ? `กึ่งอัตโนมัติ: จะถามก่อนสรุปเมื่อแชทถึงข้อความ #${Math.max(nextAt, (st.remindAt ?? 0) - 1)}`
+        : `สรุปอัตโนมัติรอบถัดไปเมื่อแชทถึงข้อความ #${nextAt}`;
     const html = `
       <div class="mh_tp_head"><b><span class="mh_icon_slot"></span> Memory Hub</b> <span class="mh_tp_dim">${esc(botName())}</span>
         <i class="fa-solid fa-xmark mh_tp_close" data-mh="close" title="ปิด"></i></div>
       <div class="mh_tp_stat">สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> จากทั้งหมด ${len} · ยังไม่สรุป <b>${pending}</b> · ความจำ ${st.memories.length} ก้อน</div>
       ${s.style === 'custom' ? '<div class="mh_tp_dim">Prompt สรุป: เขียนเองทั้งหมด</div>' : topbarModulesHtml()}
-      <div class="mh_tp_dim">${!s.enabled ? 'Memory Hub ปิดอยู่' : !s.autoSummarize ? 'สรุปอัตโนมัติปิดอยู่' : paused ? `สรุปอัตโนมัติพักไว้หลังล้มเหลว จนถึงข้อความ #${autoPausedUntil - 1} <a href="#" data-mh="resume">ลองตอนนี้</a>` : `สรุปอัตโนมัติรอบถัดไปเมื่อแชทถึงข้อความ #${nextAt}`}</div>
+      <div class="mh_tp_dim">${modeLine}</div>
+      ${backlog ? `<div class="mh_bad">⚠ ค้าง ${pending} ข้อความ ถูกส่งเต็มทุกเทิร์น และข้อความเก่าอาจหลุดจาก context ก่อนถูกจำ <a href="#" data-mh="now">สรุปเลย</a></div>` : ''}
       ${jobHtml}
       <div class="mh_tp_btns">
         <div class="menu_button${busy ? ' disabled' : ''}" data-mh="now"><i class="fa-solid fa-wand-magic-sparkles"></i> สรุปเดี๋ยวนี้</div>
@@ -1927,6 +2055,7 @@ jQuery(() => {
             lastInjection = null;
             cancelRequested = true;
             autoPausedUntil = 0;
+            backlogWarned = 0;
             reconcile({ announce: true });
             refreshUi();
         });
