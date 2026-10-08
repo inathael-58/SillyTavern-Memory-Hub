@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.5.1'; // keep in sync with manifest.json
+const VERSION = '1.5.2'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -302,7 +302,9 @@ function wordBudget() {
     const response = Math.max(s.responseLength, Math.ceil((memory + (s.overviewEnabled ? overview : 0)) * 5 + 400));
     // models cannot count Thai words, so the length is also given as a number of bullets
     const bullets = Math.min(10, Math.max(4, Math.round(memory / 22)));
-    return { memory, overview, response, bullets };
+    // longer memories need a bigger recall budget to fit the same number of them
+    const recall = Math.round(s.recallBudget * memory / Math.max(1, s.memoryWords));
+    return { memory, overview, response, bullets, recall };
 }
 
 // ---------------------------------------------------------------- model calls (with fallback chain)
@@ -628,13 +630,15 @@ async function selectRecall(st, queryText) {
         extra++;
     }
 
-    // budget: pinned first, then the latest, then by relevance
+    // budget: pinned first, then the latest, then by relevance;
+    // pinned and the latest always go in, even over the budget
+    const budget = wordBudget().recall;
     const picked = [];
     let tokens = 0;
     for (const m of chosen.values()) {
         const t = await countTokens(memoryBlock(m));
-        if (tokens + t > s.recallBudget && picked.length) continue;
-        if (t > s.recallBudget && !m.pinned) continue;
+        const must = m.pinned || (s.includeLatest && m.id === latest?.id);
+        if (!must && tokens + t > budget) continue;
         picked.push(m);
         tokens += t;
     }
@@ -1051,7 +1055,7 @@ async function buildExport({ withSource = false } = {}) {
             keepRaw: s.keepRaw,
             text: fill(summaryTemplate(), s.overviewEnabled),
         },
-        recall: { topK: s.topK, budget: s.recallBudget, queryDepth: s.queryDepth, lastInjection },
+        recall: { topK: s.topK, budget: wordBudget().recall, queryDepth: s.queryDepth, lastInjection },
         stats: {
             memories: st.memories.length,
             summarizedSourceTokens: srcTotal,
@@ -1175,7 +1179,7 @@ function renderSettings() {
               <div class="menu_button" id="mh_mod_preview"><i class="fa-solid fa-eye"></i> ดู prompt ที่ประกอบแล้ว</div>
               <div class="menu_button" id="mh_mod_manage"><i class="fa-solid fa-puzzle-piece"></i> จัดการโมดูล / สร้างเอง</div>
             </div>
-            <label class="checkbox_label"><input type="checkbox" id="mh_autowords"> ขยายความยาวความจำและเรื่องย่อตามโมดูลอัตโนมัติ</label>
+            <label class="checkbox_label"><input type="checkbox" id="mh_autowords"> ขยายความยาวความจำ เรื่องย่อ และงบความจำที่ดึง ตามโมดูลอัตโนมัติ</label>
             <small id="mh_words_now" class="mh_hint"></small>
           </div>
 
@@ -1188,7 +1192,7 @@ function renderSettings() {
 
           <h4>การดึงความจำ</h4>
           ${numberRow('mh_topk', 'ดึงความจำที่เกี่ยวข้องสูงสุด (ก้อน)', 'ไม่นับก้อนล่าสุดและก้อนที่ปักหมุด', 0, 20)}
-          ${numberRow('mh_budget', 'งบโทเคนของความจำที่ดึง', 'รวมทุกก้อนที่ดึงมา (ไม่นับเรื่องย่อ)', 100, 8000)}
+          ${numberRow('mh_budget', 'งบโทเคนของความจำที่ดึง', 'รวมทุกก้อนที่ดึงมา (ไม่นับเรื่องย่อ) ขยายตามโมดูลถ้าเปิดไว้ ก้อนที่ปักหมุดและก้อนล่าสุดใส่เสมอแม้เกินงบ', 100, 8000)}
           ${numberRow('mh_qdepth', 'ดูบริบทจากข้อความล่าสุด (ข้อความ)', 'ใช้ข้อความล่าสุดกี่ข้อความเป็นตัวตัดสินว่าอะไรเกี่ยวข้อง', 1, 20)}
 
           <h4>API ที่ใช้สรุป (เรียงตามลำดับ ตัวแรกพังจะใช้ตัวถัดไป)</h4>
@@ -1346,7 +1350,7 @@ function renderModulePicker() {
       </label>`).join(''));
     $('#mh_mod_reset').toggleClass('disabled', r.from !== 'bot');
     const w = wordBudget();
-    $('#mh_words_now').text(`บอทนี้: ความจำ ≤ ${w.memory} คำ · เรื่องย่อ ≤ ${w.overview} คำ · response ${w.response} โทเคน`);
+    $('#mh_words_now').text(`บอทนี้: ความจำ ≤ ${w.memory} คำ · เรื่องย่อ ≤ ${w.overview} คำ · response ${w.response} โทเคน · งบความจำที่ดึง ${w.recall} โทเคน`);
 }
 
 /** The line under the module chips: works on phones, where tooltips do not. */
