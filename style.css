@@ -140,15 +140,17 @@
 #mh_topbar_btn[data-bpos="bl"] .mh_topbadge { right: auto; left: -6px; }
 #mh_topbar_btn[data-bpos="center"] .mh_topbadge { right: auto; bottom: auto; left: 50%; top: 50%; transform: translate(-50%, -50%); }
 #mh_topbar_btn[data-bstyle="pill"] .mh_topbadge { border-color: transparent; }
-#mh_topbar_btn[data-bstyle="plain"] .mh_topbadge {
-    background: none; border: 0; padding: 0;
-    text-shadow: 0 0 2px var(--SmartThemeBlurTintColor, #222), 0 0 2px var(--SmartThemeBlurTintColor, #222);
-}
 /* the number takes the icon's place; the icon comes back when there is no number */
+#mh_topbar_btn[data-bstyle="replace"].mh_has_badge { display: inline-flex; align-items: center; justify-content: center; }
 #mh_topbar_btn[data-bstyle="replace"].mh_has_badge .mh_icon_slot { display: none; }
 #mh_topbar_btn[data-bstyle="replace"] .mh_topbadge {
     position: static; transform: none; background: none; border: 0; padding: 0;
-    font-size: calc(var(--mh-badge-size, 9px) + 3px);
+    color: var(--mh-badge-fg, currentColor); /* theme colors: same as the other top-bar icons */
+    font: 600 var(--mh-badge-em, 1em)/1 var(--monoFontFamily, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.03em;
+    /* centre the digits themselves (cap height to baseline), not the font's line box */
+    text-box: trim-both cap alphabetic;
 }
 #mh_topbar_btn .mh_topbadge.mh_bad { border-color: #e5484d; color: #e5484d; }
 #mh_ownbar {
