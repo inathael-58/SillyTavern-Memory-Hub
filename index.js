@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.6.0'; // keep in sync with manifest.json
+const VERSION = '1.7.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -125,6 +125,12 @@ const DEFAULTS = Object.freeze({
     topbar: true,           // button + panel in the chat top bar (Top Info Bar extension)
     topbarFallback: true,   // our own slim bar when Top Info Bar is not installed
     icon: 'svg:heart',      // see ICONS
+    badgeStyle: 'badge',    // badge (with border) | pill (no border) | plain (number only) | replace (number instead of the icon) | none
+    badgePos: 'br',         // br | tr | bl | center
+    badgeColor: 'theme',    // theme | quote | em | underline | custom
+    badgeFg: '#ffffff',     // custom colors
+    badgeBg: '#444444',
+    badgeSize: 9,           // px
 });
 
 // ---------------------------------------------------------------- icons
@@ -1262,6 +1268,35 @@ function renderSettings() {
           <label class="checkbox_label" title="ปุ่มสมองบนแถบด้านบนของแชท: ดูคิวที่กำลังสรุป สรุปถึงข้อความไหนแล้ว และปุ่มสรุปทันที / สรุปแล้วขึ้นแชทใหม่"><input type="checkbox" id="mh_topbar"> ปุ่มบนแถบด้านบนของแชท (ใช้ร่วมกับ Top Info Bar)</label>
           <label class="checkbox_label mh_sub" title="ถ้าไม่ได้ติดตั้ง Top Info Bar จะสร้างแถบบาง ๆ ของ Memory Hub เองเหนือแชท"><input type="checkbox" id="mh_topbar_fb"> ถ้าไม่มี Top Info Bar ให้สร้างแถบเอง</label>
           <div class="mh_sub mh_iconrow"><span>ไอคอน</span><div id="mh_icons" class="mh_icons"></div></div>
+          <div class="mh_sub">
+            <label class="mh_row"><span>ป้ายตัวเลข</span>
+              <select id="mh_bstyle" class="text_pole">
+                <option value="badge">ป้ายมีขอบ</option>
+                <option value="pill">ป้ายไม่มีขอบ</option>
+                <option value="plain">ตัวเลขอย่างเดียว (minimal)</option>
+                <option value="replace">ตัวเลขแทนไอคอน</option>
+                <option value="none">ไม่แสดง</option>
+              </select></label>
+            <label class="mh_row"><span>ตำแหน่งป้าย</span>
+              <select id="mh_bpos" class="text_pole">
+                <option value="br">ขวาล่าง</option>
+                <option value="tr">ขวาบน</option>
+                <option value="bl">ซ้ายล่าง</option>
+                <option value="center">ตรงกลาง (ทับไอคอน)</option>
+              </select></label>
+            <label class="mh_row"><span>สีป้าย</span>
+              <select id="mh_bcolor" class="text_pole">
+                <option value="theme">ตามธีม (สีตัวหนังสือหลัก)</option>
+                <option value="quote">ตามธีม: สีคำพูด (Quote)</option>
+                <option value="em">ตามธีม: สีตัวเอียง (Em)</option>
+                <option value="underline">ตามธีม: สีขีดเส้นใต้</option>
+                <option value="custom">เลือกเอง</option>
+              </select></label>
+            <div class="mh_row" id="mh_bcustom"><span>สีตัวเลข / สีพื้นป้าย</span>
+              <span class="mh_colors"><input type="color" id="mh_bfg" title="สีตัวเลข (และขอบ)"><input type="color" id="mh_bbg" title="สีพื้นป้าย"></span></div>
+            <label class="mh_row"><span>ขนาดตัวเลข</span>
+              <select id="mh_bsize" class="text_pole"><option value="9">เล็ก</option><option value="11">กลาง</option><option value="13">ใหญ่</option></select></label>
+          </div>
 
           <h4>Prompt สรุป</h4>
           <label class="mh_row"><span>แบบ</span>
@@ -1356,6 +1391,13 @@ function renderSettings() {
     bindCheck('#mh_topbar_fb', 'topbarFallback');
     $('#mh_icons').html(ICONS.map(ic => `<div class="mh_iconpick" data-icon="${esc(ic)}" title="${esc(iconLabel(ic))}" tabindex="0">${iconHtml(ic)}</div>`).join(''))
         .on('click', '.mh_iconpick', function () { s.icon = this.dataset.icon; saveSettings(); applyIcon(); });
+    const bindLook = (id, key, num) => $(id).val(String(s[key])).on('change input', function () { s[key] = num ? Number(this.value) || DEFAULTS[key] : this.value; saveSettings(); refreshUi(); });
+    bindLook('#mh_bstyle', 'badgeStyle');
+    bindLook('#mh_bpos', 'badgePos');
+    bindLook('#mh_bcolor', 'badgeColor');
+    bindLook('#mh_bfg', 'badgeFg');
+    bindLook('#mh_bbg', 'badgeBg');
+    bindLook('#mh_bsize', 'badgeSize', true);
     bindNum('#mh_chunk', 'chunkSize', 4, 200);
     bindNum('#mh_keep', 'keepRaw', 2, 200);
     bindNum('#mh_snooze', 'semiSnooze', 1, 200);
@@ -1576,6 +1618,9 @@ function refreshUi() {
     }[s.mode] ?? '');
     $('#mh_chunk').siblings('span').text(s.mode === 'manual' ? 'ข้อความต่อความจำหนึ่งก้อน' : s.mode === 'semi' ? 'ถามทุก ๆ (ข้อความ)' : 'สรุปทุก ๆ (ข้อความ)');
     $('#mh_snooze').closest('.mh_row').toggle(s.mode === 'semi');
+    $('#mh_bpos').closest('.mh_row').toggle(!['replace', 'none'].includes(s.badgeStyle));
+    $('#mh_bcolor, #mh_bsize').closest('.mh_row').toggle(s.badgeStyle !== 'none');
+    $('#mh_bcustom').toggle(s.badgeStyle !== 'none' && s.badgeColor === 'custom');
     renderModulePicker();
 
     let status;
@@ -1947,6 +1992,21 @@ const ago = ts => {
     return m < 1 ? 'เมื่อกี้' : m < 60 ? `${m} นาทีที่แล้ว` : new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
 
+const BADGE_THEME = { quote: '--SmartThemeQuoteColor', em: '--SmartThemeEmColor', underline: '--SmartThemeUnderlineColor' };
+/** Badge look from the settings: CSS variables + data attributes on the button. */
+function applyBadgeLook(s) {
+    const st = barBtn.style;
+    barBtn.dataset.bstyle = s.badgeStyle;
+    barBtn.dataset.bpos = s.badgePos;
+    const fg = s.badgeColor === 'custom' ? s.badgeFg : BADGE_THEME[s.badgeColor] ? `var(${BADGE_THEME[s.badgeColor]})` : '';
+    const bg = s.badgeColor === 'custom' ? s.badgeBg : '';
+    const set = (k, v) => (v ? st.setProperty(k, v) : st.removeProperty(k));
+    set('--mh-badge-fg', fg);
+    set('--mh-badge-bd', fg);
+    set('--mh-badge-bg', bg);
+    set('--mh-badge-size', `${Number(s.badgeSize) || 9}px`);
+}
+
 function renderTopbar() {
     if (!ensureTopbar()) return;
     const s = settings();
@@ -1962,8 +2022,10 @@ function renderTopbar() {
     const pending = Math.max(0, len - 1 - st.lastEnd);
     const failed = lastJob && !lastJob.ok && !busy;
     const backlog = hasBacklog(s, st, len);
-    badge.textContent = busy && job ? `${Math.min(job.done + 1, job.total || 1)}/${job.total || 1}` : (st.lastEnd >= 0 ? `#${st.lastEnd}` : '');
+    applyBadgeLook(s);
+    badge.textContent = s.badgeStyle === 'none' ? '' : busy && job ? `${Math.min(job.done + 1, job.total || 1)}/${job.total || 1}` : (st.lastEnd >= 0 ? `#${st.lastEnd}` : '');
     badge.classList.toggle('mh_bad', !!failed || backlog);
+    barBtn.classList.toggle('mh_has_badge', !!badge.textContent);
     barBtn.title = busy ? `Memory Hub: ${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `Memory Hub: สรุปแล้วถึงข้อความ #${st.lastEnd} · ยังไม่สรุป ${pending}`;
     if (ownBar) ownBar.querySelector('.mh_ownbar_text').textContent = busy ? `${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `สรุปถึง #${st.lastEnd} · ค้าง ${pending}`;
 
