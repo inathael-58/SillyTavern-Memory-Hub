@@ -126,15 +126,30 @@
 #mh_topbar_btn { position: relative; }
 #mh_topbar_btn.mh_busy { color: var(--SmartThemeQuoteColor, #e18a24); animation: mh_pulse 1.2s ease-in-out infinite; }
 @keyframes mh_pulse { 50% { opacity: 0.45; } }
+/* badge look: colors come from --mh-badge-* (set from the settings), else the theme */
 #mh_topbar_btn .mh_topbadge {
     position: absolute; right: -6px; bottom: -4px;
-    font: 600 9px/1.4 var(--mainFontFamily, sans-serif);
+    font: 600 var(--mh-badge-size, 9px)/1.4 var(--mainFontFamily, sans-serif);
     padding: 0 3px; border-radius: 999px; pointer-events: none; white-space: nowrap;
-    color: var(--SmartThemeBodyColor, #ddd);
-    background: var(--SmartThemeBlurTintColor, #222);
-    border: 1px solid var(--SmartThemeBorderColor, #555);
+    color: var(--mh-badge-fg, var(--SmartThemeBodyColor, #ddd));
+    background: var(--mh-badge-bg, var(--SmartThemeBlurTintColor, #222));
+    border: 1px solid var(--mh-badge-bd, var(--SmartThemeBorderColor, #555));
 }
 #mh_topbar_btn .mh_topbadge:empty { display: none; }
+#mh_topbar_btn[data-bpos="tr"] .mh_topbadge { bottom: auto; top: -4px; }
+#mh_topbar_btn[data-bpos="bl"] .mh_topbadge { right: auto; left: -6px; }
+#mh_topbar_btn[data-bpos="center"] .mh_topbadge { right: auto; bottom: auto; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+#mh_topbar_btn[data-bstyle="pill"] .mh_topbadge { border-color: transparent; }
+#mh_topbar_btn[data-bstyle="plain"] .mh_topbadge {
+    background: none; border: 0; padding: 0;
+    text-shadow: 0 0 2px var(--SmartThemeBlurTintColor, #222), 0 0 2px var(--SmartThemeBlurTintColor, #222);
+}
+/* the number takes the icon's place; the icon comes back when there is no number */
+#mh_topbar_btn[data-bstyle="replace"].mh_has_badge .mh_icon_slot { display: none; }
+#mh_topbar_btn[data-bstyle="replace"] .mh_topbadge {
+    position: static; transform: none; background: none; border: 0; padding: 0;
+    font-size: calc(var(--mh-badge-size, 9px) + 3px);
+}
 #mh_topbar_btn .mh_topbadge.mh_bad { border-color: #e5484d; color: #e5484d; }
 #mh_ownbar {
     display: flex; align-items: center; gap: 0.5em;
@@ -176,6 +191,8 @@
 .mh_iconrow { display: flex; align-items: flex-start; gap: 0.6em; margin: 0.2em 0 0.4em; }
 .mh_iconrow > span { padding-top: 0.35em; white-space: nowrap; }
 .mh_icons { display: flex; flex-wrap: wrap; gap: 0.25em; }
+.mh_colors { display: flex; gap: 0.4em; flex: 0 0 auto; }
+.mh_colors input[type="color"] { width: 2.4em; height: 1.8em; padding: 0; border: 1px solid var(--SmartThemeBorderColor, #555); border-radius: 4px; background: none; cursor: pointer; }
 .mh_iconpick {
     width: 2em; height: 2em; display: inline-flex; align-items: center; justify-content: center;
     border: 1px solid var(--SmartThemeBorderColor, #555); border-radius: 8px; cursor: pointer; font-size: 1.05em;
