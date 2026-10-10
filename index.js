@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.7.1'; // keep in sync with manifest.json
+const VERSION = '1.8.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -107,7 +107,7 @@ const DEFAULTS = Object.freeze({
     includeLatest: true,
     style: 'modules',       // modules | custom
     defaultModules: null,   // module ids for bots without a choice; null = relationship (solo) / ensemble+story (group)
-    botModules: {},         // 'char:<avatar>' | 'group:<id>' -> module ids
+    botModules: {},         // 'group:<id>' -> module ids (characters keep theirs as tags on the card)
     customModules: [],      // user-made modules (same shape as BUILTIN_MODULES)
     autoWords: true,        // add the modules' extra words to the lengths below
     sources: null,          // ordered list: 'main' or Connection Profile ids
@@ -265,37 +265,146 @@ function botName() {
     if (c.groupId) return c.groups?.find(g => g.id === c.groupId)?.name ?? 'กลุ่ม';
     return c.characters?.[c.characterId]?.name ?? '';
 }
+const lc = t => String(t ?? '').trim().toLowerCase();
+/** Marks a card whose owner chose no modules at all (otherwise no module tags = the default set). */
+const BASIC_TAG = 'memhub-basic';
+const currentChar = () => { const c = ctx(); return c.groupId ? null : (c.characters?.[c.characterId] ?? null); };
+/** Tags saved inside the card file itself. */
+const cardTags = ch => [...new Set([...(Array.isArray(ch?.tags) ? ch.tags : []), ...(Array.isArray(ch?.data?.tags) ? ch.data.tags : [])].map(String))];
+/** SillyTavern's tags for this bot (this install only) plus the card's own tags (travel with the card file). */
 function botTagNames() {
     const c = ctx();
     const key = c.groupId ?? c.characters?.[c.characterId]?.avatar;
-    const ids = key ? (c.tagMap?.[key] ?? []) : [];
-    return ids.map(id => c.tags?.find(t => t.id === id)?.name).filter(Boolean);
+    const mapped = (key ? (c.tagMap?.[key] ?? []) : []).map(id => c.tags?.find(t => t.id === id)?.name);
+    const seen = new Set();
+    return [...mapped, ...cardTags(currentChar())].filter(t => t && !seen.has(lc(t)) && seen.add(lc(t)));
 }
 const moduleList = () => allModules(settings().customModules);
+const isModuleTag = (t, mods = moduleList()) => lc(t) === BASIC_TAG || mods.some(m => (m.tags ?? []).some(x => lc(x) === lc(t)));
 
 /** @returns {{ids:string[], from:'bot'|'tags'|'default', tags?:string[]}} */
 function resolveModules() {
     const s = settings();
-    const known = new Set(moduleList().map(m => m.id));
+    const mods = moduleList();
+    const known = new Set(mods.map(m => m.id));
     const key = botKey();
     const own = key ? s.botModules?.[key] : null;
     if (Array.isArray(own)) return { ids: own.filter(id => known.has(id)), from: 'bot' };
-    const tags = botTagNames();
-    const byTag = modulesFromTags(tags, moduleList());
-    if (byTag.length) return { ids: byTag, from: 'tags', tags };
+    const tags = botTagNames().filter(t => isModuleTag(t, mods));
+    const byTag = modulesFromTags(tags, mods);
+    if (byTag.length || tags.length) return { ids: byTag, from: 'tags', tags };
     const def = Array.isArray(s.defaultModules) ? s.defaultModules : (isGroup() ? ['ensemble', 'story'] : ['relationship']);
     return { ids: def.filter(id => known.has(id)), from: 'default' };
 }
-/** Sets this bot's own module list (kept in module order). */
+/**
+ * Sets this bot's modules. A character gets them as tags on its card, so the
+ * same modules apply on every device and app that opens the card; a group
+ * (no card) keeps them in this install's settings.
+ */
 function setBotModules(ids) {
     const key = botKey();
     if (!key) { toast.warn('เปิดแชทก่อน'); return false; }
     const want = new Set(ids);
-    settings().botModules[key] = moduleList().map(m => m.id).filter(id => want.has(id));
+    const list = moduleList().map(m => m.id).filter(id => want.has(id));
+    const ch = currentChar();
+    if (ch) {
+        tagCard(ch, list);
+        delete settings().botModules[key];
+    } else {
+        settings().botModules[key] = list;
+    }
     saveSettings();
     return true;
 }
-const MOD_FROM_TH = { bot: 'เลือกเอง', tags: 'จากแท็ก', default: 'ค่าเริ่มต้น' };
+
+/**
+ * Makes the card's module tags match `ids` (null = remove them all, back to the default).
+ * Updates SillyTavern's tag list right away and writes the card file in the background.
+ */
+function tagCard(ch, ids, { quiet = false } = {}) {
+    const s = settings();
+    const c = ctx();
+    const mods = moduleList();
+    const wanted = ids ? mods.filter(m => ids.includes(m.id)) : [];
+    const current = botTagNames();
+    const keep = t => (ids && !wanted.length && lc(t) === BASIC_TAG) || wanted.some(m => (m.tags ?? []).some(x => lc(x) === lc(t)));
+    const remove = current.filter(t => isModuleTag(t, mods) && !keep(t));
+    const add = [];
+    for (const m of wanted) {
+        if (current.some(t => (m.tags ?? []).some(x => lc(x) === lc(t)))) continue;
+        if (m.tags?.length) { add.push(m.tags[0]); continue; }
+        // one of our own modules without tags: its name becomes its tag
+        const own = s.customModules.find(x => x.id === m.id);
+        if (own) own.tags = [m.name];
+        add.push(m.name);
+    }
+    if (ids && !wanted.length && !current.some(t => lc(t) === BASIC_TAG)) add.push(BASIC_TAG);
+    if (!add.length && !remove.length) return;
+
+    // SillyTavern's tags (this install)
+    const gone = new Set(remove.map(lc));
+    const map = c.tagMap;
+    const tags = c.tags;
+    if (map && tags) {
+        map[ch.avatar] = (map[ch.avatar] ?? []).filter(id => !gone.has(lc(tags.find(t => t.id === id)?.name)));
+        for (const name of add) {
+            let tag = tags.find(t => lc(t.name) === lc(name));
+            if (!tag) {
+                tag = {
+                    id: globalThis.crypto?.randomUUID?.() ?? uid(), name,
+                    folder_type: 'NONE', filter_state: 'UNDEFINED',
+                    sort_order: Math.max(0, ...tags.map(t => t.sort_order ?? 0)) + 1,
+                    is_hidden_on_character_card: false, color: '', color2: '', create_date: Date.now(),
+                };
+                tags.push(tag);
+            }
+            if (!map[ch.avatar].includes(tag.id)) map[ch.avatar].push(tag.id);
+        }
+        saveSettings();
+    }
+
+    // the card file (goes wherever the card goes)
+    const before = cardTags(ch);
+    const names = [...before.filter(t => !gone.has(lc(t))), ...add.filter(t => !before.some(x => lc(x) === lc(t)))];
+    writeCardTags(ch, names).catch(e => toast.err(`บันทึกแท็กลงไฟล์การ์ดไม่สำเร็จ: ${errText(e)}\nแท็กยังอยู่ในเครื่องนี้ แต่จะไม่ติดการ์ดไปเครื่องอื่น`));
+    if (!quiet) {
+        const parts = [add.length ? `เพิ่ม ${add.join(', ')}` : '', remove.length ? `เอาออก ${remove.join(', ')}` : ''].filter(Boolean);
+        toast.info(`แท็กของการ์ด ${ch.name}: ${parts.join(' · ')}`);
+    }
+}
+
+async function writeCardTags(ch, names) {
+    ch.tags = names;
+    if (ch.data) ch.data.tags = names;
+    if (ch.json_data) {
+        try {
+            const j = JSON.parse(ch.json_data);
+            j.tags = names;
+            if (j.data) j.data.tags = names;
+            ch.json_data = JSON.stringify(j);
+        } catch { /* keep what ST has */ }
+    }
+    const res = await fetch('/api/characters/merge-attributes', {
+        method: 'POST',
+        headers: ctx().getRequestHeaders(),
+        body: JSON.stringify({ avatar: ch.avatar, tags: names, data: { tags: names } }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+/** 1.7.x kept a character's modules in this install's settings; move them onto the card. */
+function migrateBotModules() {
+    const s = settings();
+    const ch = currentChar();
+    const key = botKey();
+    if (!ch || !key || !Array.isArray(s.botModules?.[key])) return;
+    const ids = s.botModules[key];
+    delete s.botModules[key];
+    tagCard(ch, ids);
+    saveSettings();
+    toast.info(`ย้ายโมดูลที่เลือกไว้ของ ${ch.name} ไปเป็นแท็กบนการ์ดแล้ว เครื่องอื่นที่เปิดการ์ดนี้จะใช้โมดูลชุดเดียวกัน`);
+}
+const MOD_FROM_TH = { bot: 'เลือกเอง', tags: 'จากแท็กของการ์ด', default: 'ค่าเริ่มต้น' };
 /** Tooltip text: what it remembers, which bots it suits, which tags switch it on. */
 function moduleTip(m) {
     return [m.name, m.desc && `จำ: ${m.desc}`, m.fit && `เหมาะกับ: ${m.fit}`, m.tags?.length && `แท็กที่เปิดเอง: ${m.tags.join(', ')}`].filter(Boolean).join('\n');
@@ -1311,7 +1420,7 @@ function renderSettings() {
             <div id="mh_mods" class="mh_mods"></div>
             <div id="mh_modinfo" class="mh_modinfo">ชี้หรือแตะที่โมดูลเพื่อดูว่าเหมาะกับแนวไหน</div>
             <div class="mh_btns">
-              <div class="menu_button" id="mh_mod_reset" title="เลิกใช้ที่เลือกเองของบอทนี้ กลับไปใช้แท็กหรือค่าเริ่มต้น"><i class="fa-solid fa-rotate-left"></i> กลับไปใช้แท็ก/ค่าเริ่มต้น</div>
+              <div class="menu_button" id="mh_mod_reset" title="เอาแท็กโมดูลออกจากการ์ด (แชทกลุ่ม: เลิกใช้ที่เลือกไว้) แล้วกลับไปใช้ค่าเริ่มต้น"><i class="fa-solid fa-rotate-left"></i> กลับไปใช้ค่าเริ่มต้น</div>
               <div class="menu_button" id="mh_mod_setdef" title="บอทที่ยังไม่ได้เลือกและไม่มีแท็กที่ตรง จะใช้ชุดนี้"><i class="fa-solid fa-star"></i> ตั้งชุดนี้เป็นค่าเริ่มต้น</div>
               <div class="menu_button" id="mh_mod_preview"><i class="fa-solid fa-eye"></i> ดู prompt ที่ประกอบแล้ว</div>
               <div class="menu_button" id="mh_mod_manage"><i class="fa-solid fa-puzzle-piece"></i> จัดการโมดูล / สร้างเอง</div>
@@ -1435,7 +1544,19 @@ function renderSettings() {
     }).on('pointerenter focusin', '.mh_mod', function () {
         showModuleInfo(this.querySelector('input')?.value);
     });
-    $('#mh_mod_reset').on('click', () => { const key = botKey(); if (key) delete s.botModules[key]; saveSettings(); refreshUi(); });
+    $('#mh_mod_reset').on('click', async () => {
+        const key = botKey();
+        if (!key) return;
+        const ch = currentChar();
+        if (ch) {
+            const tags = resolveModules().tags ?? [];
+            if (!tags.length) return;
+            const ok = await ctx().callGenericPopup(`เอาแท็ก ${tags.join(', ')} ออกจากการ์ด ${ch.name}? บอทนี้จะกลับไปใช้โมดูลค่าเริ่มต้น`, ctx().POPUP_TYPE.CONFIRM);
+            if (!ok) return;
+            tagCard(ch, null);
+        } else delete s.botModules[key];
+        saveSettings(); refreshUi();
+    });
     $('#mh_mod_setdef').on('click', () => { s.defaultModules = [...resolveModules().ids]; saveSettings(); refreshUi(); toast.ok('ตั้งเป็นค่าเริ่มต้นแล้ว'); });
     $('#mh_mod_preview').on('click', previewPrompt);
     $('#mh_mod_manage').on('click', manageModules);
@@ -1492,9 +1613,9 @@ function renderModulePicker() {
     const key = botKey();
     $('#mh_botname').text(key ? botName() : '(ยังไม่ได้เปิดแชท)');
     const r = resolveModules();
-    const src = r.from === 'bot' ? 'เลือกเองสำหรับบอทนี้'
-        : r.from === 'tags' ? `จากแท็กของบอท: ${r.tags.join(', ')} — ติ๊กเพื่อปรับเฉพาะบอทนี้`
-            : `ค่าเริ่มต้น${Array.isArray(s.defaultModules) ? '' : (isGroup() ? ' (แชทกลุ่ม)' : ' (แชทเดี่ยว)')} — ติ๊กเพื่อปรับเฉพาะบอทนี้ หรือใส่แท็กให้บอทใน SillyTavern`;
+    const src = r.from === 'bot' ? 'เลือกเองสำหรับกลุ่มนี้ (เก็บในเครื่องนี้)'
+        : r.from === 'tags' ? `จากแท็กของการ์ด: ${r.tags.join(', ')} — ติ๊กเพื่อเปลี่ยน แท็กบนการ์ดจะเปลี่ยนตาม`
+            : `ค่าเริ่มต้น${Array.isArray(s.defaultModules) ? '' : (isGroup() ? ' (แชทกลุ่ม)' : ' (แชทเดี่ยว)')} — ${isGroup() ? 'ติ๊กเพื่อเลือกให้กลุ่มนี้' : 'ติ๊กเพื่อเลือก แล้ว Memory Hub จะแปะแท็กให้การ์ด ใช้ได้ทุกเครื่องที่เปิดการ์ดนี้'}`;
     $('#mh_modsrc').text(src);
     const on = new Set(r.ids);
     $('#mh_mods').html(moduleList().map(m => `
@@ -1502,7 +1623,7 @@ function renderModulePicker() {
         <input type="checkbox" value="${esc(m.id)}"${on.has(m.id) ? ' checked' : ''}${key ? '' : ' disabled'}>
         <span>${esc(m.name)}${m.custom ? ' <i class="fa-solid fa-pen-nib" title="โมดูลของเรา"></i>' : ''}</span>
       </label>`).join(''));
-    $('#mh_mod_reset').toggleClass('disabled', r.from !== 'bot');
+    $('#mh_mod_reset').toggleClass('disabled', r.from === 'default');
     const w = wordBudget();
     $('#mh_words_now').text(`บอทนี้ (ก้อนละ ${settings().chunkSize} ข้อความ): ความจำ ≤ ${w.memory} คำ · เรื่องย่อ ≤ ${w.overview} คำ · response ${w.response} โทเคน · งบความจำที่ดึง ${w.recall} โทเคน`);
 }
@@ -2121,6 +2242,7 @@ jQuery(() => {
             cancelRequested = true;
             autoPausedUntil = 0;
             backlogWarned = 0;
+            migrateBotModules();
             reconcile({ announce: true });
             refreshUi();
         });
