@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.7.0'; // keep in sync with manifest.json
+const VERSION = '1.7.1'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -125,7 +125,7 @@ const DEFAULTS = Object.freeze({
     topbar: true,           // button + panel in the chat top bar (Top Info Bar extension)
     topbarFallback: true,   // our own slim bar when Top Info Bar is not installed
     icon: 'svg:heart',      // see ICONS
-    badgeStyle: 'badge',    // badge (with border) | pill (no border) | plain (number only) | replace (number instead of the icon) | none
+    badgeStyle: 'badge',    // badge (with border) | pill (no border) | replace (number instead of the icon) | none
     badgePos: 'br',         // br | tr | bl | center
     badgeColor: 'theme',    // theme | quote | em | underline | custom
     badgeFg: '#ffffff',     // custom colors
@@ -194,6 +194,8 @@ function settings() {
         if (s.responseLength === 1200) s.responseLength = 800;
     }
     if (s.style === 'auto') s.style = 'modules';
+    // migrate 1.7.0: the plain-number badge was hard to read
+    if (s.badgeStyle === 'plain') s.badgeStyle = 'badge';
     // migrate 1.5.x: the on/off switch became a mode
     if (s.mode == null && s.autoSummarize === false) s.mode = 'manual';
     delete s.autoSummarize;
@@ -1273,7 +1275,6 @@ function renderSettings() {
               <select id="mh_bstyle" class="text_pole">
                 <option value="badge">ป้ายมีขอบ</option>
                 <option value="pill">ป้ายไม่มีขอบ</option>
-                <option value="plain">ตัวเลขอย่างเดียว (minimal)</option>
                 <option value="replace">ตัวเลขแทนไอคอน</option>
                 <option value="none">ไม่แสดง</option>
               </select></label>
@@ -2005,6 +2006,8 @@ function applyBadgeLook(s) {
     set('--mh-badge-bd', fg);
     set('--mh-badge-bg', bg);
     set('--mh-badge-size', `${Number(s.badgeSize) || 9}px`);
+    // in place of the icon: large makes the digits about as tall as the icon
+    set('--mh-badge-em', `${{ 9: 1, 11: 1.25, 13: 1.6 }[s.badgeSize] ?? 1}em`);
 }
 
 function renderTopbar() {
