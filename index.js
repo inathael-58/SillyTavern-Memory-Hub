@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.8.0'; // keep in sync with manifest.json
+const VERSION = '1.9.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -125,11 +125,12 @@ const DEFAULTS = Object.freeze({
     topbar: true,           // button + panel in the chat top bar (Top Info Bar extension)
     topbarFallback: true,   // our own slim bar when Top Info Bar is not installed
     icon: 'svg:heart',      // see ICONS
-    badgeStyle: 'badge',    // badge (with border) | pill (no border) | replace (number instead of the icon) | none
+    badgeStyle: 'badge',    // badge | pill (no border) | replace (number instead of the icon) | replace-badge (badge instead of the icon) | none
     badgePos: 'br',         // br | tr | bl | center
     badgeColor: 'theme',    // theme | quote | em | underline | custom
     badgeFg: '#ffffff',     // custom colors
     badgeBg: '#444444',
+    badgeBd: '#888888',
     badgeSize: 9,           // px
 });
 
@@ -414,11 +415,12 @@ function activeModules() {
     const ids = new Set(resolveModules().ids);
     return moduleList().filter(m => ids.has(m.id));
 }
-function wordBudget({ boost } = {}) {
+let rangeSize = null; // messages in a hand-picked range while it is being summarized
+function wordBudget({ boost, size } = {}) {
     const s = settings();
     const extra = s.autoWords ? extraWords(activeModules()) : { memory: 0, overview: 0 };
     // more messages per memory need longer memories; the default chunk is the baseline
-    const per = s.autoWords ? Math.max(1, s.chunkSize / DEFAULTS.chunkSize) : 1;
+    const per = s.autoWords ? Math.max(1, (size ?? rangeSize ?? s.chunkSize) / DEFAULTS.chunkSize) : 1;
     const scale = per * (boost ?? (Number(s.quotaBoost) || 1));
     const memory = Math.round((s.memoryWords + extra.memory) * scale);
     const overview = s.overviewWords + extra.overview;
@@ -1359,6 +1361,7 @@ function renderSettings() {
           <div class="mh_btns">
             <div class="menu_button" id="mh_open"><span class="mh_icon_slot"></span> เปิดคลังความจำ</div>
             <div class="menu_button" id="mh_now"><i class="fa-solid fa-wand-magic-sparkles"></i> สรุปตอนนี้</div>
+            <div class="menu_button" id="mh_range"><i class="fa-solid fa-arrows-left-right-to-line"></i> สรุปช่วงที่เลือก</div>
             <div class="menu_button" id="mh_last"><i class="fa-solid fa-eye"></i> ดูสิ่งที่ส่งล่าสุด</div>
             <div class="menu_button" id="mh_carry"><i class="fa-solid fa-forward"></i> เริ่มแชทใหม่ต่อเรื่อง</div>
           </div>
@@ -1385,6 +1388,7 @@ function renderSettings() {
                 <option value="badge">ป้ายมีขอบ</option>
                 <option value="pill">ป้ายไม่มีขอบ</option>
                 <option value="replace">ตัวเลขแทนไอคอน</option>
+                <option value="replace-badge">ป้ายแทนไอคอน</option>
                 <option value="none">ไม่แสดง</option>
               </select></label>
             <label class="mh_row"><span>ตำแหน่งป้าย</span>
@@ -1402,8 +1406,8 @@ function renderSettings() {
                 <option value="underline">ตามธีม: สีขีดเส้นใต้</option>
                 <option value="custom">เลือกเอง</option>
               </select></label>
-            <div class="mh_row" id="mh_bcustom"><span>สีตัวเลข / สีพื้นป้าย</span>
-              <span class="mh_colors"><input type="color" id="mh_bfg" title="สีตัวเลข (และขอบ)"><input type="color" id="mh_bbg" title="สีพื้นป้าย"></span></div>
+            <div class="mh_row" id="mh_bcustom"><span>สีตัวเลข / พื้น / ขอบ</span>
+              <span class="mh_colors"><input type="color" id="mh_bfg" title="สีตัวเลข"><input type="color" id="mh_bbg" title="สีพื้นป้าย"><input type="color" id="mh_bbd" title="สีขอบป้าย"></span></div>
             <label class="mh_row"><span>ขนาดตัวเลข</span>
               <select id="mh_bsize" class="text_pole"><option value="9">เล็ก</option><option value="11">กลาง</option><option value="13">ใหญ่</option></select></label>
           </div>
@@ -1507,6 +1511,7 @@ function renderSettings() {
     bindLook('#mh_bcolor', 'badgeColor');
     bindLook('#mh_bfg', 'badgeFg');
     bindLook('#mh_bbg', 'badgeBg');
+    bindLook('#mh_bbd', 'badgeBd');
     bindLook('#mh_bsize', 'badgeSize', true);
     bindNum('#mh_chunk', 'chunkSize', 4, 200);
     bindNum('#mh_keep', 'keepRaw', 2, 200);
@@ -1578,6 +1583,7 @@ function renderSettings() {
 
     $('#mh_open').on('click', openManager);
     $('#mh_now').on('click', summarizeNow);
+    $('#mh_range').on('click', chooseRangeDialog);
     $('#mh_last').on('click', showLastInjection);
     $('#mh_carry').on('click', continueInNewChat);
     renderSources();
@@ -1740,7 +1746,9 @@ function refreshUi() {
     }[s.mode] ?? '');
     $('#mh_chunk').siblings('span').text(s.mode === 'manual' ? 'ข้อความต่อความจำหนึ่งก้อน' : s.mode === 'semi' ? 'ถามทุก ๆ (ข้อความ)' : 'สรุปทุก ๆ (ข้อความ)');
     $('#mh_snooze').closest('.mh_row').toggle(s.mode === 'semi');
-    $('#mh_bpos').closest('.mh_row').toggle(!['replace', 'none'].includes(s.badgeStyle));
+    $('#mh_bpos').closest('.mh_row').toggle(!['replace', 'replace-badge', 'none'].includes(s.badgeStyle));
+    // a plain number has no background or border to colour
+    $('#mh_bbg, #mh_bbd').toggle(s.badgeStyle !== 'replace');
     $('#mh_bcolor, #mh_bsize').closest('.mh_row').toggle(s.badgeStyle !== 'none');
     $('#mh_bcustom').toggle(s.badgeStyle !== 'none' && s.badgeColor === 'custom');
     renderModulePicker();
@@ -1764,7 +1772,7 @@ function refreshUi() {
         }
     }
     $('#mh_status').html(status);
-    $('#mh_now').toggleClass('disabled', !!busy);
+    $('#mh_now, #mh_range').toggleClass('disabled', !!busy);
 
     const warns = [];
     const c = ctx();
@@ -1781,6 +1789,85 @@ function refreshUi() {
 }
 
 // ---------------------------------------------------------------- actions
+
+/** Checks a hand-picked range against the chat and what is summarized already. */
+function checkRange(from, to) {
+    const st = state();
+    const len = ctx().chat.length;
+    if (!st) return { error: 'เปิดแชทก่อน' };
+    if (!Number.isInteger(from) || !Number.isInteger(to)) return { error: 'ใส่เลขข้อความให้ครบ' };
+    if (from > to) return { error: 'ข้อความแรกต้องไม่มากกว่าข้อความสุดท้าย' };
+    if (to > len - 1) return { error: `แชทนี้มีถึงข้อความ #${len - 1}` };
+    if (from <= st.lastEnd) return { error: `ข้อความถึง #${st.lastEnd} สรุปไปแล้ว เริ่มได้ตั้งแต่ #${st.lastEnd + 1} (ถ้าจะสรุปก้อนเดิมใหม่ ใช้ 🔄 ในคลังความจำ)` };
+    const skip = from > st.lastEnd + 1 ? [st.lastEnd + 1, from - 1] : null;
+    return { n: to - from + 1, skip, words: wordBudget({ size: to - from + 1 }).memory };
+}
+
+/** Summarizes exactly chat[from..to] into one memory, for people who set the rhythm themselves. */
+async function summarizeChosenRange(from, to) {
+    const chk = checkRange(from, to);
+    if (chk.error) return toast.warn(chk.error);
+    if (busy) return toast.info('กำลังทำงานอยู่');
+    busy = (async () => {
+        job = { label: 'สรุปช่วงที่เลือก', done: 0, total: 1, range: `#${from}–#${to}` };
+        rangeSize = chk.n;
+        renderTopbar();
+        try {
+            const mem = await summarizeRange(from, to);
+            // messages skipped on purpose are covered too, so they stop being sent
+            const st = state();
+            if (st && st.lastEnd < to) { st.lastEnd = to; saveState(); }
+            lastJob = { ok: true, text: `สรุป #${from}–#${to} เป็นความจำ 1 ก้อน`, at: Date.now() };
+            toast.ok(mem ? `สร้างความจำ #${from}–#${to} แล้ว` : `ช่วง #${from}–#${to} ไม่มีข้อความให้สรุป`);
+        } catch (e) {
+            console.error(LOG, e);
+            lastJob = { ok: false, text: `สรุป #${from}–#${to} ไม่สำเร็จ: ${errText(e)}`, at: Date.now() };
+            toast.err(`สรุปช่วงที่เลือกไม่สำเร็จ:\n${errText(e)}`, { timeOut: 15000 });
+        } finally {
+            rangeSize = null;
+            busy = null;
+            job = null;
+            refreshUi();
+        }
+    })();
+    return busy;
+}
+
+async function chooseRangeDialog() {
+    const st = state();
+    if (!st) return toast.warn('เปิดแชทก่อน');
+    if (busy) return toast.info('กำลังทำงานอยู่');
+    const s = settings();
+    const c = ctx();
+    const last = c.chat.length - 1;
+    const box = document.createElement('div');
+    box.className = 'mh_carry';
+    box.innerHTML = `
+      <h3>สรุปช่วงที่เลือก</h3>
+      <p>สรุปข้อความตั้งแต่ข้อความไหนถึงข้อความไหน เป็นความจำ 1 ก้อน สรุปแล้วถึง #${st.lastEnd} · ล่าสุดคือ #${last}</p>
+      <label class="mh_row"><span>ตั้งแต่ข้อความ #</span><input type="number" class="text_pole mh_rg_from" min="0" max="${last}"></label>
+      <label class="mh_row"><span>ถึงข้อความ #</span><input type="number" class="text_pole mh_rg_to" min="0" max="${last}"></label>
+      <div class="mh_rg_info mh_hint"></div>`;
+    const fromIn = box.querySelector('.mh_rg_from');
+    const toIn = box.querySelector('.mh_rg_to');
+    const info = box.querySelector('.mh_rg_info');
+    fromIn.value = Math.min(st.lastEnd + 1, last);
+    toIn.value = Math.min(last, st.lastEnd + s.chunkSize);
+    const show = () => {
+        const chk = checkRange(parseInt(fromIn.value, 10), parseInt(toIn.value, 10));
+        if (chk.error) { info.innerHTML = `<span class="mh_bad">${esc(chk.error)}</span>`; return; }
+        const lines = [`${chk.n} ข้อความ → ความจำ 1 ก้อน ยาวไม่เกิน ~${chk.words} คำ`];
+        if (chk.skip) lines.push(`<span class="mh_bad">⚠ ข้อความ #${chk.skip[0]}–#${chk.skip[1]} จะถูกข้าม: ไม่ถูกจำ และไม่ถูกส่งให้บอทอีก</span>`);
+        if (chk.n > s.chunkSize * 3) lines.push('ช่วงยาวมาก รายละเอียดเล็ก ๆ จะหายมากขึ้น ถ้าอยากละเอียดให้แบ่งเป็นหลายช่วง หรือเพิ่มตัวคูณโควต้าความจำ');
+        info.innerHTML = lines.join('<br>');
+    };
+    fromIn.addEventListener('input', show);
+    toIn.addEventListener('input', show);
+    show();
+    const ok = await c.callGenericPopup(box, c.POPUP_TYPE.CONFIRM, '', { okButton: 'สรุปช่วงนี้', cancelButton: 'ยกเลิก' });
+    if (!ok) return;
+    await summarizeChosenRange(parseInt(fromIn.value, 10), parseInt(toIn.value, 10));
+}
 
 async function summarizeNow() {
     if (!state()) return toast.warn('เปิดแชทก่อน');
@@ -2087,6 +2174,7 @@ async function onTopbarClick(e) {
     e.preventDefault();
     if (a === 'close') barPanel.classList.remove('mh_open');
     else if (a === 'now') await summarizeNow();
+    else if (a === 'range') await chooseRangeDialog();
     else if (a === 'carry') await continueInNewChat();
     else if (a === 'open') await openManager();
     else if (a === 'last') await showLastInjection();
@@ -2122,9 +2210,10 @@ function applyBadgeLook(s) {
     barBtn.dataset.bpos = s.badgePos;
     const fg = s.badgeColor === 'custom' ? s.badgeFg : BADGE_THEME[s.badgeColor] ? `var(${BADGE_THEME[s.badgeColor]})` : '';
     const bg = s.badgeColor === 'custom' ? s.badgeBg : '';
+    const bd = s.badgeColor === 'custom' ? s.badgeBd : fg;
     const set = (k, v) => (v ? st.setProperty(k, v) : st.removeProperty(k));
     set('--mh-badge-fg', fg);
-    set('--mh-badge-bd', fg);
+    set('--mh-badge-bd', bd);
     set('--mh-badge-bg', bg);
     set('--mh-badge-size', `${Number(s.badgeSize) || 9}px`);
     // in place of the icon: large makes the digits about as tall as the icon
@@ -2147,7 +2236,14 @@ function renderTopbar() {
     const failed = lastJob && !lastJob.ok && !busy;
     const backlog = hasBacklog(s, st, len);
     applyBadgeLook(s);
-    badge.textContent = s.badgeStyle === 'none' ? '' : busy && job ? `${Math.min(job.done + 1, job.total || 1)}/${job.total || 1}` : (st.lastEnd >= 0 ? `#${st.lastEnd}` : '');
+    const inPlace = s.badgeStyle.startsWith('replace');
+    const text = s.badgeStyle === 'none' ? '' : busy && job ? `${Math.min(job.done + 1, job.total || 1)}/${job.total || 1}` : (st.lastEnd >= 0 ? `${inPlace ? '' : '#'}${st.lastEnd}` : '');
+    badge.textContent = text;
+    // in the icon's place the width must stay about two icons wide, or the top bar wraps:
+    // long numbers get a smaller font instead (monospace digits are ~0.6em wide)
+    const em = { 9: 1, 11: 1.25, 13: 1.6 }[s.badgeSize] ?? 1;
+    const room = s.badgeStyle === 'replace-badge' ? 2 : 2.4;
+    barBtn.style.setProperty('--mh-fit', String(inPlace && text ? Math.min(1, room / (0.6 * text.length * em)) : 1));
     badge.classList.toggle('mh_bad', !!failed || backlog);
     barBtn.classList.toggle('mh_has_badge', !!badge.textContent);
     barBtn.title = busy ? `Memory Hub: ${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `Memory Hub: สรุปแล้วถึงข้อความ #${st.lastEnd} · ยังไม่สรุป ${pending}`;
@@ -2189,6 +2285,7 @@ function renderTopbar() {
         <div class="menu_button${busy ? ' disabled' : ''}" data-mh="now"><i class="fa-solid fa-wand-magic-sparkles"></i> สรุปเดี๋ยวนี้</div>
         <div class="menu_button${busy ? ' disabled' : ''}" data-mh="carry"><i class="fa-solid fa-forward"></i> สรุป + ขึ้นแชทใหม่</div>
         <div class="menu_button" data-mh="open"><i class="fa-solid fa-book-open"></i> คลังความจำ</div>
+        <div class="menu_button${busy ? ' disabled' : ''}" data-mh="range"><i class="fa-solid fa-arrows-left-right-to-line"></i> สรุปช่วง…</div>
         <div class="menu_button" data-mh="last"><i class="fa-solid fa-eye"></i> ส่งอะไรไปล่าสุด</div>
       </div>`;
     // only touch the DOM when something changed (this runs every 2 s)
@@ -2210,6 +2307,16 @@ function registerCommands() {
         name: 'memhub-now',
         callback: async () => { await summarizeNow(); return ''; },
         helpString: 'Memory Hub: สรุปข้อความที่ยังไม่ได้สรุปทันที',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'memhub-range',
+        callback: async (_args, value) => {
+            const m = String(value ?? '').match(/(\d+)\D+(\d+)/);
+            if (m) await summarizeChosenRange(Number(m[1]), Number(m[2]));
+            else await chooseRangeDialog();
+            return '';
+        },
+        helpString: 'Memory Hub: สรุปข้อความช่วงที่เลือกเป็นความจำ 1 ก้อน เช่น <code>/memhub-range 40-75</code> (ไม่ใส่เลขจะเปิดหน้าต่างให้เลือก)',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'memhub-export',
