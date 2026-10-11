@@ -141,16 +141,28 @@
 #mh_topbar_btn[data-bpos="center"] .mh_topbadge { right: auto; bottom: auto; left: 50%; top: 50%; transform: translate(-50%, -50%); }
 #mh_topbar_btn[data-bstyle="pill"] .mh_topbadge { border-color: transparent; }
 /* the number takes the icon's place; the icon comes back when there is no number */
-#mh_topbar_btn[data-bstyle="replace"].mh_has_badge { display: inline-flex; align-items: center; justify-content: center; }
-#mh_topbar_btn[data-bstyle="replace"].mh_has_badge .mh_icon_slot { display: none; }
-#mh_topbar_btn[data-bstyle="replace"] .mh_topbadge {
-    position: static; transform: none; background: none; border: 0; padding: 0;
-    color: var(--mh-badge-fg, currentColor); /* theme colors: same as the other top-bar icons */
-    font: 600 var(--mh-badge-em, 1em)/1 var(--monoFontFamily, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+#mh_topbar_btn[data-bstyle^="replace"].mh_has_badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    flex-shrink: 0; white-space: nowrap;
+}
+#mh_topbar_btn[data-bstyle^="replace"].mh_has_badge .mh_icon_slot { display: none; }
+#mh_topbar_btn[data-bstyle^="replace"] .mh_topbadge {
+    position: static; transform: none;
+    /* --mh-fit shrinks long numbers so the button never pushes the bar onto two lines */
+    font: 600 calc(var(--mh-badge-em, 1em) * var(--mh-fit, 1))/1 var(--monoFontFamily, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
     font-variant-numeric: tabular-nums;
     letter-spacing: -0.03em;
     /* centre the digits themselves (cap height to baseline), not the font's line box */
     text-box: trim-both cap alphabetic;
+}
+#mh_topbar_btn[data-bstyle="replace"] .mh_topbadge {
+    background: none; border: 0; padding: 0;
+    color: var(--mh-badge-fg, currentColor); /* theme colors: same as the other top-bar icons */
+}
+#mh_topbar_btn[data-bstyle="replace-badge"] .mh_topbadge {
+    /* with its padding, a badge taller than the icons would stretch the bar */
+    font-size: min(calc(var(--mh-badge-em, 1em) * var(--mh-fit, 1) * 0.85), 1em);
+    padding: 0.3em 0.4em;
 }
 #mh_topbar_btn .mh_topbadge.mh_bad { border-color: #e5484d; color: #e5484d; }
 #mh_ownbar {
@@ -193,7 +205,7 @@
 .mh_iconrow { display: flex; align-items: flex-start; gap: 0.6em; margin: 0.2em 0 0.4em; }
 .mh_iconrow > span { padding-top: 0.35em; white-space: nowrap; }
 .mh_icons { display: flex; flex-wrap: wrap; gap: 0.25em; }
-.mh_colors { display: flex; gap: 0.4em; flex: 0 0 auto; }
+.mh_colors { display: flex; gap: 0.4em; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; }
 .mh_colors input[type="color"] { width: 2.4em; height: 1.8em; padding: 0; border: 1px solid var(--SmartThemeBorderColor, #555); border-radius: 4px; background: none; cursor: pointer; }
 .mh_iconpick {
     width: 2em; height: 2em; display: inline-flex; align-items: center; justify-content: center;
