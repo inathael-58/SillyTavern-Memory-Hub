@@ -21,12 +21,12 @@
  * Profiles); when one fails, times out or answers empty, the next is tried.
  */
 
-import { cleanKeys, cleanText, hasSegmenter, isComplete, nextChunk, parseMany, parseSummary, rankMemories } from './lib.js';
+import { blockKind, cleanKeys, cleanText, hasSegmenter, isComplete, nextChunk, parseMany, parseSummary, rankMemories } from './lib.js';
 import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords, modulesFromTags } from './modules.js';
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.9.0'; // keep in sync with manifest.json
+const VERSION = '1.9.1'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -530,7 +530,17 @@ async function callModel(system, user, maxTokens, accept = out => !!String(out ?
         return partial;
     }
     lastApi = { ok: false, label: sourceLabel(order[0]), error: errors.join(' · '), at: Date.now() };
-    throw new Error(errors.join(' · '));
+    const err = new Error(errors.join(' · '));
+    const kinds = errors.map(blockKind);
+    err.blocked = kinds.includes('prohibited') ? 'prohibited' : kinds.includes('filter') ? 'filter' : null;
+    throw err;
+}
+
+/** Why a summary of `range` failed, in words a user can act on. */
+function failText(e, range) {
+    if (e?.blocked === 'prohibited') return `Gemini บล็อกเนื้อหาช่วง ${range} (PROHIBITED_CONTENT) ตัวกรองนี้ปิดไม่ได้แม้ตั้ง safety เป็น OFF — เพิ่ม API สำรองที่ไม่ใช่ Gemini (เช่น DeepSeek) หรือแก้ข้อความช่วงนั้น\n${errText(e)}`;
+    if (e?.blocked) return `ช่วง ${range} อาจโดนตัวกรองเนื้อหาของผู้ให้บริการ — ลองเพิ่ม API สำรองจากผู้ให้บริการอื่น หรือแก้ข้อความช่วงนั้น\n${errText(e)}`;
+    return errText(e);
 }
 
 // ---------------------------------------------------------------- summarizing
@@ -539,6 +549,7 @@ let busy = null;          // Promise of the running summarization
 let cancelRequested = false;
 let lastInjection = null; // what the last generation received (for the preview)
 let autoPausedUntil = 0;  // chat length; auto-summary waits after a failure
+let blockedChunk = null;  // { chatId, start, end }: the chunk a content filter keeps stopping
 
 function transcript(start, end) {
     const { chat } = ctx();
@@ -582,7 +593,7 @@ async function summarizeRange(start, end, { replaceId = null, updateOverview = t
     if (!body.trim()) return null;
 
     const withOverview = s.overviewEnabled && updateOverview;
-    const prev = latestOf(st.memories.filter(m => m.source !== 'auto' || m.end < start));
+    const prev = latestOf(st.memories.filter(m => (m.source !== 'auto' || m.end < start) && String(m.text ?? '').trim()));
     const parts = [];
     if (withOverview) parts.push(`PREVIOUS OVERVIEW:\n${st.overview.trim() || '(none yet — this is the start of the story)'}`);
     if (prev) parts.push(`PREVIOUS MEMORY (for continuity, do not repeat it):\n${memoryBlock(prev)}`);
@@ -600,7 +611,7 @@ async function summarizeRange(start, end, { replaceId = null, updateOverview = t
     let mem;
     if (replaceId) {
         mem = cur.memories.find(m => m.id === replaceId);
-        if (mem) Object.assign(mem, { title: parsed.title || mem.title, keys: keys.length ? keys : mem.keys, text: parsed.text, ts: Date.now(), truncated: partial || undefined });
+        if (mem) Object.assign(mem, { title: parsed.title || mem.title, keys: keys.length ? keys : mem.keys, text: parsed.text, ts: Date.now(), truncated: partial || undefined, blocked: undefined });
     }
     if (!mem) {
         mem = { id: uid(), start, end, title: parsed.title || `#${start}–#${end}`, keys, text: parsed.text, pinned: false, source: 'auto', ts: Date.now(), ...(partial ? { truncated: true } : {}) };
@@ -640,6 +651,7 @@ function runSummaries({ force = false, quiet = false, keepRaw = null } = {}) {
         let made = 0;
         let failed = false;
         let progress = null;
+        let chunk = null;
         job = { label: 'สรุปข้อความ', done: 0, total: plannedChunks(force, keepRaw) };
         renderTopbar();
         try {
@@ -648,7 +660,7 @@ function runSummaries({ force = false, quiet = false, keepRaw = null } = {}) {
                 const st = state();
                 if (!st) break;
                 const s = settings();
-                const chunk = nextChunk(st.lastEnd, ctx().chat.length, s.chunkSize, keepRaw ?? s.keepRaw, force);
+                chunk = nextChunk(st.lastEnd, ctx().chat.length, s.chunkSize, keepRaw ?? s.keepRaw, force);
                 if (!chunk) break;
                 // the top bar panel already shows progress; no toast on top of it
                 if ((!quiet || made > 0) && !barPanel?.classList.contains('mh_open')) {
@@ -667,8 +679,15 @@ function runSummaries({ force = false, quiet = false, keepRaw = null } = {}) {
             failed = true;
             console.error(LOG, e);
             autoPausedUntil = ctx().chat.length + 4;
-            lastJob = { ok: false, text: `สรุป ${job?.range ?? ''} ไม่สำเร็จ: ${errText(e)}`, at: Date.now() };
-            toast.err(`สรุปไม่สำเร็จ ลองครบทุก API แล้ว:\n${errText(e)}`, { timeOut: 15000 });
+            const range = job?.range ?? '';
+            lastJob = { ok: false, text: `สรุป ${range} ไม่สำเร็จ: ${failText(e, range)}`, at: Date.now() };
+            if (e?.blocked && chunk) {
+                blockedChunk = { chatId: ctx().chatId, start: chunk.start, end: chunk.end };
+                toast.err(`สรุปไม่สำเร็จ ลองครบทุก API แล้ว:\n${failText(e, range)}\nแตะที่นี่เพื่อข้ามช่วงนี้ (สร้างความจำว่างไว้เขียนเอง)`,
+                    { timeOut: 20000, extendedTimeOut: 10000, onclick: () => skipBlocked() });
+            } else {
+                toast.err(`สรุปไม่สำเร็จ ลองครบทุก API แล้ว:\n${errText(e)}`, { timeOut: 15000 });
+            }
         } finally {
             if (progress) globalThis.toastr?.clear(progress);
             busy = null;
@@ -681,6 +700,44 @@ function runSummaries({ force = false, quiet = false, keepRaw = null } = {}) {
         return { made, failed };
     })();
     return busy;
+}
+
+/** The chunk a content filter stopped, if it is still the next one of this chat. */
+function currentBlocked() {
+    const st = state();
+    const b = blockedChunk;
+    if (!b || !st || b.chatId !== ctx().chatId || st.lastEnd + 1 !== b.start) return null;
+    return b;
+}
+
+/**
+ * Gives up on a chunk the filters keep stopping: an empty memory takes its
+ * place so the chunks after it can be summarized. The memory is left for the
+ * user to write (or 🔄 to retry later with another API).
+ */
+async function skipBlocked() {
+    const b = currentBlocked();
+    if (!b) return toast.info('ไม่มีช่วงที่ค้างเพราะถูกบล็อกแล้ว');
+    if (busy) return toast.info('กำลังทำงานอยู่');
+    const c = ctx();
+    const ok = await c.callGenericPopup(`
+      <h3>ข้ามช่วง #${b.start}–#${b.end}?</h3>
+      <p>จะสร้างความจำว่างแทนช่วงนี้ แล้วสรุปช่วงถัดไปต่อ</p>
+      <p>ข้อความช่วงนี้จะไม่ถูกส่งให้บอทอีก (เหมือนช่วงที่สรุปแล้ว) จนกว่าจะเขียนความจำก้อนนี้เอง บอทจะไม่รู้ว่าช่วงนี้เกิดอะไรขึ้น
+      เปิด "จัดการความจำ" เพื่อเขียนเอง หรือกด 🔄 ที่ความจำก้อนนั้นเพื่อลองสรุปใหม่ภายหลัง (เช่น หลังเพิ่ม API สำรอง)</p>`,
+    c.POPUP_TYPE.CONFIRM, '', { okButton: 'ข้ามช่วงนี้', cancelButton: 'ยังก่อน' });
+    if (!ok || busy || currentBlocked() !== b) return;
+    const st = state();
+    st.memories.push({ id: uid(), start: b.start, end: b.end, title: `#${b.start}–#${b.end} (ถูกบล็อก)`, keys: [], text: '', pinned: false, source: 'auto', blocked: true, ts: Date.now(), overviewAfter: st.overview });
+    st.memories.sort((x, y) => (x.start - y.start) || (x.ts - y.ts));
+    st.lastEnd = Math.max(st.lastEnd, b.end);
+    saveState();
+    blockedChunk = null;
+    autoPausedUntil = 0;
+    lastJob = { ok: true, text: `ข้าม #${b.start}–#${b.end} แล้ว (ความจำว่าง รอเขียนเอง)`, at: Date.now() };
+    toast.info(`ข้าม #${b.start}–#${b.end} แล้ว แตะที่นี่เพื่อเปิดจัดการความจำและเขียนเอง`, { timeOut: 10000, onclick: () => openManager() });
+    refreshUi();
+    if (settings().mode === 'auto') onMessageReceived(null, 'normal');
 }
 
 function onMessageReceived(_id, type) {
@@ -1303,7 +1360,7 @@ function exportMarkdown(x) {
     x.memories.forEach((m, i) => {
         const where = m.end >= 0 ? `#${m.start}–#${m.end}` : m.source === 'carry' ? 'จากแชทก่อน' : m.source === 'import' ? 'นำเข้า' : 'เพิ่มเอง';
         const st = m.stats.srcTokens ? ` · ต้นฉบับ ${m.stats.srcTokens} → ${m.stats.memTokens} โทเคน (${pct(m.stats.ratio)})` : ` · ${m.stats.memTokens} โทเคน`;
-        lines.push(`### ${i + 1}. ${m.title || '(ไม่มีชื่อ)'}${m.pinned ? ' 📌' : ''}${m.truncated ? ' ⚠ คำตอบถูกตัด' : ''}`, '', `_${where}${st}_  `, `คีย์: ${(m.keys ?? []).join(', ') || '—'}`, '', String(m.text ?? '').trim(), '');
+        lines.push(`### ${i + 1}. ${m.title || '(ไม่มีชื่อ)'}${m.pinned ? ' 📌' : ''}${m.truncated ? ' ⚠ คำตอบถูกตัด' : ''}${m.blocked && !String(m.text ?? '').trim() ? ' ⛔ ถูกบล็อก (ยังไม่ได้เขียน)' : ''}`, '', `_${where}${st}_  `, `คีย์: ${(m.keys ?? []).join(', ') || '—'}`, '', String(m.text ?? '').trim(), '');
         if (m.sourceMessages?.length) {
             lines.push('<details><summary>ข้อความต้นฉบับ</summary>', '');
             for (const s of m.sourceMessages) lines.push(`> **${s.name}:** ${s.mes.replace(/\n+/g, ' ')}`, '>');
@@ -1821,8 +1878,8 @@ async function summarizeChosenRange(from, to) {
             toast.ok(mem ? `สร้างความจำ #${from}–#${to} แล้ว` : `ช่วง #${from}–#${to} ไม่มีข้อความให้สรุป`);
         } catch (e) {
             console.error(LOG, e);
-            lastJob = { ok: false, text: `สรุป #${from}–#${to} ไม่สำเร็จ: ${errText(e)}`, at: Date.now() };
-            toast.err(`สรุปช่วงที่เลือกไม่สำเร็จ:\n${errText(e)}`, { timeOut: 15000 });
+            lastJob = { ok: false, text: `สรุป #${from}–#${to} ไม่สำเร็จ: ${failText(e, `#${from}–#${to}`)}`, at: Date.now() };
+            toast.err(`สรุปช่วงที่เลือกไม่สำเร็จ:\n${failText(e, `#${from}–#${to}`)}`, { timeOut: 15000 });
         } finally {
             rangeSize = null;
             busy = null;
@@ -1916,6 +1973,7 @@ function memoryCard(m, recalled) {
       <div class="mh_card_head">
         <input class="text_pole mh_title" value="${esc(m.title)}" placeholder="ชื่อ">
         <span class="mh_range" title="${esc(m.origin?.chat ?? '')}">${esc(range)}</span>
+        ${m.blocked && !String(m.text ?? '').trim() ? '<span class="mh_trunc" title="ช่วงนี้ถูกตัวกรองเนื้อหาของผู้ให้บริการบล็อก จึงข้ามไว้ — เขียนความจำเองในช่องด้านล่าง หรือกด 🔄 เพื่อลองใหม่">⛔ ถูกบล็อก</span>' : ''}
         ${m.truncated ? '<span class="mh_trunc" title="คำตอบของโมเดลถูกตัดกลางคัน ความจำนี้อาจไม่ครบ — เพิ่ม Response length แล้วกด 🔄">⚠ ไม่ครบ</span>' : ''}
         <i class="fa-solid fa-thumbtack mh_icon mh_pin" title="ปักหมุด: ใส่ใน prompt ทุกครั้ง"></i>
         ${m.end >= 0 && m.source === 'auto' ? '<i class="fa-solid fa-rotate mh_icon mh_resum" title="สรุปช่วงนี้ใหม่ (เช่น หลังแก้ข้อความ)"></i>' : ''}
@@ -2029,7 +2087,7 @@ async function openManager() {
                 busy = summarizeRange(m.start, m.end, { replaceId: m.id, updateOverview: false });
                 await busy;
                 toast.ok('สรุปช่วงนี้ใหม่แล้ว');
-            } catch (err) { toast.err(`สรุปไม่สำเร็จ: ${errText(err)}`, { timeOut: 15000 }); } finally { busy = null; job = null; renderTopbar(); }
+            } catch (err) { toast.err(`สรุปไม่สำเร็จ: ${failText(err, `#${m.start}–#${m.end}`)}`, { timeOut: 15000 }); } finally { busy = null; job = null; renderTopbar(); }
             renderManagerList(); refreshUi();
         }
     });
@@ -2179,6 +2237,7 @@ async function onTopbarClick(e) {
     else if (a === 'open') await openManager();
     else if (a === 'last') await showLastInjection();
     else if (a === 'stop') { cancelRequested = true; toast.info('จะหยุดหลังก้อนที่กำลังทำเสร็จ'); }
+    else if (a === 'skip') await skipBlocked();
     else if (a === 'resume') { autoPausedUntil = 0; onMessageReceived(null, 'normal'); }
     else if (a === 'mod-del') {
         const id = t.closest('[data-id]')?.dataset.id;
@@ -2267,6 +2326,8 @@ function renderTopbar() {
     }
     if (queued) jobHtml += `<div class="mh_tp_dim">รอคิวอีก ${queued} รอบ</div>`;
     if (lastJob && !busy) jobHtml += `<div class="${lastJob.ok ? 'mh_ok' : 'mh_bad'}">${lastJob.ok ? '✔' : '✖'} ${esc(lastJob.text)} <span class="mh_tp_dim">· ${ago(lastJob.at)}</span></div>`;
+    const blocked = !busy && currentBlocked();
+    if (blocked) jobHtml += `<div class="mh_bad">⛔ ช่วง #${blocked.start}–#${blocked.end} ถูกตัวกรองเนื้อหาบล็อก สรุปช่วงถัดไปไม่ได้จนกว่าจะผ่านช่วงนี้ <a href="#" data-mh="skip">ข้ามช่วงนี้ (เขียนเอง)</a></div>`;
     const paused = !busy && s.mode !== 'manual' && autoPausedUntil > len;
     const modeLine = !s.enabled ? 'Memory Hub ปิดอยู่'
         : paused ? `สรุปอัตโนมัติพักไว้หลังล้มเหลว จนถึงข้อความ #${autoPausedUntil - 1} <a href="#" data-mh="resume">ลองตอนนี้</a>`

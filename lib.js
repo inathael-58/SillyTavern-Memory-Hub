@@ -128,6 +128,20 @@ export function parseSummary(raw) {
 }
 
 /**
+ * Did a provider's content filter stop this answer?
+ * 'prohibited' = Gemini's PROHIBITED_CONTENT, which no safety setting turns off;
+ * 'filter' = another filter, or an answer with nothing in it.
+ * SillyTavern reports a blocked Gemini answer as "no candidate" or "Candidate text empty".
+ * @returns {'prohibited'|'filter'|null}
+ */
+export function blockKind(text) {
+    const s = String(text ?? '');
+    if (/PROHIBITED_CONTENT/i.test(s)) return 'prohibited';
+    if (/blockReason|BLOCKLIST|\bSPII\b|\bSAFETY\b|no candidate|candidate text empty|content[_ ]?filter|content management policy|ได้คำตอบว่าง/i.test(s)) return 'filter';
+    return null;
+}
+
+/**
  * Which messages should the next summary cover?
  * Leaves the newest `keepRaw` messages alone. Without `force`, only a full
  * chunk of `chunkSize` messages is taken.
