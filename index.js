@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.9.2'; // keep in sync with manifest.json
+const VERSION = '1.9.3'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -2056,11 +2056,19 @@ function memoryCard(m, recalled) {
         ${m.end >= 0 && m.source === 'auto' ? '<i class="fa-solid fa-rotate mh_icon mh_resum" title="สรุปช่วงนี้ใหม่ (เช่น หลังแก้ข้อความ)"></i>' : ''}
         <i class="fa-solid fa-trash mh_icon mh_del" title="ลบ"></i>
       </div>
-      <input class="text_pole mh_keys" value="${esc((m.keys ?? []).join(', '))}" placeholder="คีย์ (คั่นด้วย ,)">
+      <textarea class="text_pole mh_keys" rows="1" placeholder="คีย์ (คั่นด้วย , หรือขึ้นบรรทัดใหม่)">${esc((m.keys ?? []).join(', '))}</textarea>
       <textarea class="text_pole mh_text" rows="4">${esc(m.text)}</textarea>
       ${recalled ? '<small class="mh_tag">ถูกใส่ใน prompt ล่าสุด</small>' : ''}
     </div>`;
 }
+
+/** Grows a keys box to show every key, so long ones need no scrolling sideways. */
+function fitKeys(el) {
+    if (!el.isConnected) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight + el.offsetHeight - el.clientHeight}px`;
+}
+const fitAllKeys = () => requestAnimationFrame(() => managerEl?.querySelectorAll('.mh_keys').forEach(fitKeys));
 
 function renderManagerList() {
     const st = state();
@@ -2070,6 +2078,7 @@ function renderManagerList() {
     const recalled = new Set(lastInjection?.picked.map(p => p.id) ?? []);
     const mems = [...st.memories].reverse().filter(m => !f || `${m.title} ${(m.keys ?? []).join(' ')} ${m.text}`.toLowerCase().includes(f));
     list.innerHTML = mems.length ? mems.map(m => memoryCard(m, recalled.has(m.id))).join('') : '<div class="mh_empty">ยังไม่มีความจำ กด "สรุปตอนนี้" หรือคุยต่อไปจนครบรอบ</div>';
+    fitAllKeys();
     const hasImports = st.memories.some(m => m.source === 'import' && !m.optimized);
     managerEl.querySelector('.mh_do_optimize')?.classList.toggle('mh_hidden', !hasImports);
 }
@@ -2119,7 +2128,7 @@ async function openManager() {
         const m = t.closest?.('.mh_card') && find(t);
         if (!m) return;
         if (t.classList.contains('mh_title')) m.title = t.value;
-        else if (t.classList.contains('mh_keys')) m.keys = t.value.split(/[,，]/).map(x => x.trim()).filter(Boolean);
+        else if (t.classList.contains('mh_keys')) { m.keys = t.value.split(/[,，\n]/).map(x => x.trim()).filter(Boolean); fitKeys(t); }
         else if (t.classList.contains('mh_text')) m.text = t.value;
         else return;
         saveState();
@@ -2180,7 +2189,9 @@ async function openManager() {
     });
 
     popup = new Popup(root, POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: 'ปิด' });
-    await popup.show();
+    const shown = popup.show();
+    fitAllKeys(); // sizes need the popup on screen
+    await shown;
     managerEl = null;
     refreshUi();
 }
