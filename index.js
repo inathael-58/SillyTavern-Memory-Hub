@@ -21,12 +21,12 @@
  * Profiles); when one fails, times out or answers empty, the next is tried.
  */
 
-import { blockKind, cleanKeys, cleanText, hasSegmenter, isComplete, nextChunk, parseMany, parseSummary, rankMemories } from './lib.js';
+import { blockKind, cleanKeys, cleanText, findGaps, hasSegmenter, isComplete, nextChunk, parseMany, parseSummary, rankMemories } from './lib.js';
 import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords, modulesFromTags } from './modules.js';
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.9.1'; // keep in sync with manifest.json
+const VERSION = '1.9.2'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -206,7 +206,7 @@ function settings() {
 }
 const saveSettings = () => ctx().saveSettingsDebounced();
 
-/** @returns {{v:number, memories:any[], overview:string, lastEnd:number, baseOverview?:string, chain?:string[]}|null} */
+/** @returns {{v:number, memories:any[], overview:string, lastEnd:number, skips?:Array<[number, number]>, baseOverview?:string, chain?:string[]}|null} */
 function state() {
     const c = ctx();
     if (!c.chatId) return null;
@@ -620,7 +620,10 @@ async function summarizeRange(start, end, { replaceId = null, updateOverview = t
         cur.lastEnd = Math.max(cur.lastEnd, end);
     }
     if (withOverview && parsed.overview) cur.overview = parsed.overview;
-    if (!replaceId) mem.overviewAfter = cur.overview; // lets a branch restore the story-so-far of its time
+    // lets a branch restore the story-so-far of its time; a chunk filled in
+    // behind newer ones takes the one of the memory before it
+    if (!replaceId) mem.overviewAfter = updateOverview ? cur.overview
+        : (latestOf(cur.memories.filter(m => m.source === 'auto' && m.end < start))?.overviewAfter ?? cur.baseOverview ?? '');
     saveState();
     return mem;
 }
@@ -858,8 +861,39 @@ function reconcile({ announce = false } = {}) {
         if (announce) toast.info(`แชทนี้สั้นกว่าที่ความจำครอบคลุม (เช่น แตกกิ่ง) — ถอดความจำหลังจุดนั้นออก ${dropped} ก้อน และย้อนเรื่องย่อกลับไปตามจุดนั้นแล้ว`, { timeOut: 8000 });
     }
     if (st.lastEnd > len - 1) { st.lastEnd = len - 1; changed = true; }
+    if (st.skips?.length) {
+        const kept = st.skips.filter(([, b]) => b <= len - 1);
+        if (kept.length !== st.skips.length) { st.skips = kept; changed = true; }
+    }
+    // The newest memory was deleted: step back, so those messages are sent in
+    // full again and the next summary picks them up.
+    const tail = gapsOf(st).at(-1);
+    if (tail && !coveredRanges(st).some(([a, b]) => b >= tail[0] && a <= st.lastEnd)) {
+        const was = st.lastEnd;
+        st.lastEnd = tail[0] - 1;
+        const prev = latestOf(st.memories.filter(m => m.source === 'auto' && m.end >= 0 && m.end <= st.lastEnd));
+        st.overview = prev ? (prev.overviewAfter ?? st.overview) : (st.baseOverview ?? '');
+        changed = true;
+        if (announce) toast.info(`ไม่มีความจำของข้อความ #${tail[0]}–#${was} แล้ว ถอยกลับไปเป็นสรุปถึง #${st.lastEnd} และย้อนเรื่องย่อตาม ข้อความช่วงนั้นจะถูกส่งแบบเต็มจนกว่าจะสรุปใหม่`, { timeOut: 8000 });
+    }
     if (changed) { saveState(); refreshUi(); }
 }
+
+/** Message ranges a memory of this chat (or a deliberate skip) stands in for. */
+function coveredRanges(st) {
+    return [
+        ...st.memories.filter(m => m.source === 'auto' && m.end >= 0).map(m => [m.start, m.end]),
+        ...(st.skips ?? []),
+    ];
+}
+
+/** Summarized-over messages that no memory covers any more (a memory was deleted). */
+function gapsOf(st) {
+    const chat = ctx().chat ?? [];
+    const empty = i => { const m = chat[i]; return !m || m.is_system || !cleanText(m.mes); };
+    return findGaps(coveredRanges(st), Math.min(st.lastEnd, chat.length - 1), empty);
+}
+const gapLabel = ([a, b]) => a === b ? `#${a}` : `#${a}–#${b}`;
 
 // ---------------------------------------------------------------- per-generation: trim + recall
 
@@ -916,15 +950,17 @@ async function selectRecall(st, queryText) {
     return { picked, tokens, why };
 }
 
-let savedCache = { chatId: null, lastEnd: -2, tokens: 0 };
+let savedCache = { chatId: null, key: '', tokens: 0 };
 /** Rough size of the messages we stopped sending (counted once per summary). */
-async function savedTokens(lastEnd) {
+async function savedTokens(lastEnd, gaps = []) {
     const c = ctx();
-    if (savedCache.chatId === c.chatId && savedCache.lastEnd === lastEnd) return savedCache.tokens;
-    const text = c.chat.slice(0, lastEnd + 1).filter(m => !m.is_system).map(m => m.mes).join('\n');
+    const key = `${lastEnd}|${gaps.join(';')}`;
+    if (savedCache.chatId === c.chatId && savedCache.key === key) return savedCache.tokens;
+    const inGap = i => gaps.some(([a, b]) => i >= a && i <= b);
+    const text = c.chat.slice(0, lastEnd + 1).filter((m, i) => !m.is_system && !inGap(i)).map(m => m.mes).join('\n');
     let tokens;
     try { tokens = await c.getTokenCountAsync(text); } catch { tokens = Math.ceil(text.length / 3); }
-    savedCache = { chatId: c.chatId, lastEnd, tokens };
+    savedCache = { chatId: c.chatId, key, tokens };
     return tokens;
 }
 
@@ -945,13 +981,21 @@ async function intercept(chat, _contextSize, _abort, type) {
 
     // 1. drop messages already covered by memories (prompt only; the chat is untouched)
     let trimmed = 0;
+    const gaps = gapsOf(st);
     if (s.trimSummarized && st.lastEnd >= 0 && st.memories.some(m => m.source === 'auto')) {
-        let n = 0;
-        for (let i = 0; i <= st.lastEnd && i < full.length; i++) if (!full[i].is_system) n++;
+        // positions in the prompt chat (system messages are not in it); messages
+        // whose memory was deleted stay, so nothing is lost until it is redone
+        const inGap = i => gaps.some(([a, b]) => i >= a && i <= b);
+        const drop = [];
+        for (let i = 0, p = 0; i <= st.lastEnd && i < full.length; i++) {
+            if (full[i].is_system) continue;
+            if (!inGap(i)) drop.push(p);
+            p++;
+        }
         // always leave the newest keepRaw messages, even if messages were deleted
         // in the middle and the summarized range no longer lines up
-        n = Math.min(n, Math.max(0, chat.length - Math.max(2, s.keepRaw)));
-        if (n > 0) { chat.splice(0, n); trimmed = n; }
+        const cap = Math.max(0, chat.length - Math.max(2, s.keepRaw));
+        for (let k = drop.length - 1; k >= 0; k--) if (drop[k] < cap) { chat.splice(drop[k], 1); trimmed++; }
     }
 
     // 2. overview
@@ -975,7 +1019,7 @@ async function intercept(chat, _contextSize, _abort, type) {
         at: Date.now(),
         type,
         trimmed,
-        trimmedTokens: trimmed ? await savedTokens(st.lastEnd) : 0,
+        trimmedTokens: trimmed ? await savedTokens(st.lastEnd, gaps) : 0,
         overviewText,
         overviewTokens: await countTokens(overviewText),
         recallText,
@@ -1837,6 +1881,8 @@ function refreshUi() {
     if (!hasSegmenter()) warns.push('เบราว์เซอร์นี้ไม่มีตัวตัดคำ (Intl.Segmenter) จะใช้วิธีสำรองซึ่งแม่นน้อยกว่า');
     const missing = s.sources.filter(id => id !== 'main' && !profiles().some(p => p.id === id));
     if (missing.length) warns.push(`มี Connection Profile ในรายการ API ที่หาไม่เจอ ${missing.length} อัน (จะถูกข้าม)`);
+    const gaps = st ? gapsOf(st) : [];
+    if (gaps.length) warns.push(gapWarning(gaps));
     if (st && hasBacklog(s, st, c.chat.length)) warns.push(`ยังไม่สรุป ${pendingOf(st, c.chat.length)} ข้อความ (โหมด${MODE_TH[s.mode]}) ข้อความเหล่านี้ถูกส่งเต็มทุกเทิร์น กด "สรุปตอนนี้" เพื่อประหยัดโทเคนและไม่ให้ข้อความเก่าหลุดจาก context`);
     $('#mh_warn').html(warns.map(w => `<div><i class="fa-solid fa-triangle-exclamation"></i> ${esc(w)}</div>`).join(''));
 
@@ -1847,6 +1893,24 @@ function refreshUi() {
 
 // ---------------------------------------------------------------- actions
 
+const gapWarning = gaps => `ข้อความ ${gaps.map(gapLabel).join(', ')} ไม่มีความจำ (ความจำถูกลบ) ข้อความช่วงนี้ถูกส่งแบบเต็มทุกเทิร์น ใช้ "สรุปช่วง…" เพื่อสรุปใหม่`;
+
+/** Lets the messages of every gap go unremembered, as the user asked. */
+async function skipGaps() {
+    const st = state();
+    const gaps = st ? gapsOf(st) : [];
+    if (!gaps.length) return;
+    const c = ctx();
+    const ok = await c.callGenericPopup(`<h3>ไม่ต้องจำ ${esc(gaps.map(gapLabel).join(', '))}?</h3>
+      <p>ข้อความช่วงนี้จะไม่ถูกส่งให้บอทอีก (เหมือนช่วงที่สรุปแล้ว) และไม่มีความจำแทน บอทจะไม่รู้ว่าช่วงนี้เกิดอะไรขึ้น</p>`,
+    c.POPUP_TYPE.CONFIRM, '', { okButton: 'ไม่ต้องจำ', cancelButton: 'ยกเลิก' });
+    if (!ok) return;
+    const cur = state();
+    cur.skips = [...(cur.skips ?? []), ...gapsOf(cur)];
+    saveState();
+    refreshUi();
+}
+
 /** Checks a hand-picked range against the chat and what is summarized already. */
 function checkRange(from, to) {
     const st = state();
@@ -1855,7 +1919,13 @@ function checkRange(from, to) {
     if (!Number.isInteger(from) || !Number.isInteger(to)) return { error: 'ใส่เลขข้อความให้ครบ' };
     if (from > to) return { error: 'ข้อความแรกต้องไม่มากกว่าข้อความสุดท้าย' };
     if (to > len - 1) return { error: `แชทนี้มีถึงข้อความ #${len - 1}` };
-    if (from <= st.lastEnd) return { error: `ข้อความถึง #${st.lastEnd} สรุปไปแล้ว เริ่มได้ตั้งแต่ #${st.lastEnd + 1} (ถ้าจะสรุปก้อนเดิมใหม่ ใช้ 🔄 ในคลังความจำ)` };
+    if (from <= st.lastEnd) {
+        // a stretch whose memory was deleted can be summarized again on its own
+        const gaps = gapsOf(st);
+        if (gaps.some(([a, b]) => from >= a && to <= b)) return { n: to - from + 1, skip: null, fill: true, words: wordBudget({ size: to - from + 1 }).memory };
+        const hint = gaps.length ? ` หรือช่วงที่ไม่มีความจำ: ${gaps.map(gapLabel).join(', ')}` : '';
+        return { error: `ข้อความถึง #${st.lastEnd} สรุปไปแล้ว เริ่มได้ตั้งแต่ #${st.lastEnd + 1}${hint} (ถ้าจะสรุปก้อนเดิมใหม่ ใช้ 🔄 ในคลังความจำ)` };
+    }
     const skip = from > st.lastEnd + 1 ? [st.lastEnd + 1, from - 1] : null;
     return { n: to - from + 1, skip, words: wordBudget({ size: to - from + 1 }).memory };
 }
@@ -1870,10 +1940,12 @@ async function summarizeChosenRange(from, to) {
         rangeSize = chk.n;
         renderTopbar();
         try {
-            const mem = await summarizeRange(from, to);
+            const mem = await summarizeRange(from, to, { updateOverview: !chk.fill });
             // messages skipped on purpose are covered too, so they stop being sent
             const st = state();
-            if (st && st.lastEnd < to) { st.lastEnd = to; saveState(); }
+            if (st && chk.skip) st.skips = [...(st.skips ?? []), chk.skip];
+            if (st && st.lastEnd < to) st.lastEnd = to;
+            if (st) saveState();
             lastJob = { ok: true, text: `สรุป #${from}–#${to} เป็นความจำ 1 ก้อน`, at: Date.now() };
             toast.ok(mem ? `สร้างความจำ #${from}–#${to} แล้ว` : `ช่วง #${from}–#${to} ไม่มีข้อความให้สรุป`);
         } catch (e) {
@@ -1908,8 +1980,9 @@ async function chooseRangeDialog() {
     const fromIn = box.querySelector('.mh_rg_from');
     const toIn = box.querySelector('.mh_rg_to');
     const info = box.querySelector('.mh_rg_info');
-    fromIn.value = Math.min(st.lastEnd + 1, last);
-    toIn.value = Math.min(last, st.lastEnd + s.chunkSize);
+    const gap = gapsOf(st)[0];
+    fromIn.value = gap ? gap[0] : Math.min(st.lastEnd + 1, last);
+    toIn.value = gap ? gap[1] : Math.min(last, st.lastEnd + s.chunkSize);
     const show = () => {
         const chk = checkRange(parseInt(fromIn.value, 10), parseInt(toIn.value, 10));
         if (chk.error) { info.innerHTML = `<span class="mh_bad">${esc(chk.error)}</span>`; return; }
@@ -1961,7 +2034,11 @@ function renderManagerHeader() {
     const len = ctx().chat.length;
     const imported = st.memories.filter(m => m.source === 'import').length;
     const carried = st.memories.filter(m => m.source === 'carry').length;
-    el.innerHTML = `ความจำ <b>${st.memories.length}</b> ก้อน${carried ? ` (จากแชทก่อน ${carried})` : ''}${imported ? ` (นำเข้า ${imported})` : ''} · สรุปแล้วถึง #${st.lastEnd} จาก ${len} ข้อความ${busy ? ' · <i class="fa-solid fa-spinner fa-spin"></i> กำลังทำงาน <a href="#" class="mh_cancel">หยุด</a>' : ''}`;
+    const gaps = gapsOf(st);
+    el.innerHTML = `ความจำ <b>${st.memories.length}</b> ก้อน${carried ? ` (จากแชทก่อน ${carried})` : ''}${imported ? ` (นำเข้า ${imported})` : ''} · สรุปแล้วถึง #${st.lastEnd} จาก ${len} ข้อความ${busy ? ' · <i class="fa-solid fa-spinner fa-spin"></i> กำลังทำงาน <a href="#" class="mh_cancel">หยุด</a>' : ''}`
+        + (gaps.length ? `<div class="mh_bad">⚠ ${esc(gapWarning(gaps))} <a href="#" class="mh_gap_fill">สรุปช่วงนี้</a> · <a href="#" class="mh_gap_skip">ไม่ต้องจำ</a></div>` : '');
+    el.querySelector('.mh_gap_fill')?.addEventListener('click', async e => { e.preventDefault(); await chooseRangeDialog(); renderManagerList(); renderManagerHeader(); });
+    el.querySelector('.mh_gap_skip')?.addEventListener('click', async e => { e.preventDefault(); await skipGaps(); renderManagerHeader(); });
     el.querySelector('.mh_cancel')?.addEventListener('click', e => { e.preventDefault(); cancelRequested = true; toast.info('จะหยุดหลังก้อนนี้เสร็จ'); });
 }
 
@@ -2067,7 +2144,7 @@ async function openManager() {
             const ok = await ctx().callGenericPopup('ลบความจำและเรื่องย่อทั้งหมดของแชทนี้? (ข้อความในแชทไม่ถูกลบ ข้อความเก่าจะกลับไปถูกส่งแบบเต็มจนกว่าจะสรุปใหม่)', ctx().POPUP_TYPE.CONFIRM);
             if (!ok) return;
             const cur = state();
-            cur.memories = []; cur.overview = ''; cur.lastEnd = -1; delete cur.baseOverview; delete cur.chain;
+            cur.memories = []; cur.overview = ''; cur.lastEnd = -1; delete cur.skips; delete cur.baseOverview; delete cur.chain;
             saveState();
             syncOverview(); renderManagerList(); refreshUi();
             return;
@@ -2076,9 +2153,19 @@ async function openManager() {
         if (!m) return;
         if (t.classList.contains('mh_pin')) { m.pinned = !m.pinned; saveState(); renderManagerList(); }
         else if (t.classList.contains('mh_del')) {
+            if (m.source === 'auto' && m.end >= 0) {
+                if (guardBusy()) return;
+                const ok = await ctx().callGenericPopup(`<h3>ลบความจำ #${m.start}–#${m.end}?</h3>
+                  <p>ข้อความช่วงนี้จะกลับไปถูกส่งให้บอทแบบเต็มจนกว่าจะสรุปใหม่ (สรุปช่วงที่เลือก หรือ "สรุปตอนนี้" ถ้าเป็นก้อนล่าสุด)</p>
+                  <p>ถ้าแค่อยากสรุปใหม่หลังแก้ข้อความ กด 🔄 ที่ก้อนนี้แทนได้เลย</p>`,
+                ctx().POPUP_TYPE.CONFIRM, '', { okButton: 'ลบ', cancelButton: 'ยกเลิก' });
+                if (!ok) return;
+            }
             const cur = state();
             cur.memories = cur.memories.filter(x => x.id !== m.id);
-            saveState(); renderManagerList(); refreshUi();
+            saveState();
+            reconcile({ announce: true });
+            syncOverview(); renderManagerList(); refreshUi();
         } else if (t.classList.contains('mh_resum')) {
             if (guardBusy()) return;
             t.classList.add('fa-spin');
@@ -2238,6 +2325,7 @@ async function onTopbarClick(e) {
     else if (a === 'last') await showLastInjection();
     else if (a === 'stop') { cancelRequested = true; toast.info('จะหยุดหลังก้อนที่กำลังทำเสร็จ'); }
     else if (a === 'skip') await skipBlocked();
+    else if (a === 'gapskip') await skipGaps();
     else if (a === 'resume') { autoPausedUntil = 0; onMessageReceived(null, 'normal'); }
     else if (a === 'mod-del') {
         const id = t.closest('[data-id]')?.dataset.id;
@@ -2327,6 +2415,8 @@ function renderTopbar() {
     if (queued) jobHtml += `<div class="mh_tp_dim">รอคิวอีก ${queued} รอบ</div>`;
     if (lastJob && !busy) jobHtml += `<div class="${lastJob.ok ? 'mh_ok' : 'mh_bad'}">${lastJob.ok ? '✔' : '✖'} ${esc(lastJob.text)} <span class="mh_tp_dim">· ${ago(lastJob.at)}</span></div>`;
     const blocked = !busy && currentBlocked();
+    const gaps = gapsOf(st);
+    if (gaps.length) jobHtml += `<div class="mh_bad">⚠ ${esc(gapWarning(gaps))} <a href="#" data-mh="range">สรุปช่วงนี้</a> · <a href="#" data-mh="gapskip">ไม่ต้องจำ</a></div>`;
     if (blocked) jobHtml += `<div class="mh_bad">⛔ ช่วง #${blocked.start}–#${blocked.end} ถูกตัวกรองเนื้อหาบล็อก สรุปช่วงถัดไปไม่ได้จนกว่าจะผ่านช่วงนี้ <a href="#" data-mh="skip">ข้ามช่วงนี้ (เขียนเอง)</a></div>`;
     const paused = !busy && s.mode !== 'manual' && autoPausedUntil > len;
     const modeLine = !s.enabled ? 'Memory Hub ปิดอยู่'

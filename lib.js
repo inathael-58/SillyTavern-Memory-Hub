@@ -156,6 +156,32 @@ export function nextChunk(lastEnd, chatLength, chunkSize, keepRaw, force = false
     return { start, end: start + Math.min(chunkSize, available) - 1 };
 }
 
+/**
+ * Stretches of messages up to `lastEnd` that no memory covers, e.g. after a
+ * memory was deleted. Messages with nothing to summarize (system, empty) never
+ * open a gap, and do not split one either.
+ * @param {Array<[number, number]>} ranges covered [start, end] pairs
+ * @param {number} lastEnd
+ * @param {(i:number) => boolean} isEmpty
+ * @returns {Array<[number, number]>}
+ */
+export function findGaps(ranges, lastEnd, isEmpty = () => false) {
+    const covered = new Uint8Array(Math.max(0, lastEnd + 1));
+    for (const [a, b] of ranges) {
+        if (!Number.isInteger(a) || !Number.isInteger(b) || a < 0) continue;
+        for (let i = a; i <= Math.min(b, lastEnd); i++) covered[i] = 1;
+    }
+    const gaps = [];
+    let cur = null;
+    for (let i = 0; i <= lastEnd; i++) {
+        if (covered[i]) { cur = null; continue; }
+        if (isEmpty(i)) continue;
+        if (cur) cur[1] = i;
+        else gaps.push(cur = [i, i]);
+    }
+    return gaps;
+}
+
 /** Plain BM25 with a bonus for the summarizer's own keys found in the query. */
 export function rankMemories(memories, queryText, { k1 = 1.2, b = 0.75 } = {}) {
     const docs = memories.map(m => tokenize(`${m.title ?? ''} ${(m.keys ?? []).join(' ')} ${m.text ?? ''}`));
