@@ -65,7 +65,7 @@
 .mh_card .mh_icon { cursor: pointer; opacity: 0.55; padding: 0.25em; }
 .mh_card .mh_icon:hover { opacity: 1; }
 .mh_card.mh_pinned .mh_pin { opacity: 1; color: var(--SmartThemeQuoteColor, #e18a24); }
-.mh_card .mh_keys { font-size: 0.85em; }
+.mh_card .mh_keys { font-size: 0.85em; resize: none; overflow: hidden; min-height: 0; line-height: 1.4; field-sizing: content; }
 .mh_card .mh_tag { opacity: 0.75; color: var(--SmartThemeQuoteColor, #e18a24); }
 
 .mh_preview { text-align: left; }
