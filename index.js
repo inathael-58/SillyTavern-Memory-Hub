@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.10.0'; // keep in sync with manifest.json
+const VERSION = '1.10.1'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -1617,6 +1617,7 @@ function renderSettings() {
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
+          ${versionLineHtml()}
           <div id="mh_status" class="mh_status"></div>
           <div class="mh_btns">
             <div class="menu_button" id="mh_open"><span class="mh_icon_slot"></span> เปิดคลังความจำ</div>
@@ -2657,10 +2658,81 @@ function registerCommands() {
     }));
 }
 
+// ---------------------------------------------------------------- version check + hard refresh
+//
+// SillyTavern loads extension files by a fixed URL, and browsers (and home-screen web apps on
+// iOS, which rarely reload for real) keep the old files cached after "Update". Compare with the
+// manifest on the server; if it is newer, say so, and offer to refetch every file and reload.
+
+const BASE_URL = new URL('.', import.meta.url);
+/** Every file of the extension, so a hard refresh can replace all of them in the browser cache. */
+const FILES = ['index.js', 'lib.js', 'modules.js', 'style.css', 'manifest.json'];
+let remoteVersion = '';
+let versionCheckedAt = 0;
+let versionToastShown = false;
+const newerVersion = (a, b) => {
+    const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+    return false;
+};
+async function fetchRemoteVersion() {
+    try {
+        const res = await fetch(new URL('manifest.json', BASE_URL), { cache: 'no-store' });
+        if (!res.ok) return '';
+        return String((await res.json())?.version ?? '');
+    } catch { return ''; }
+}
+/** The "running vX · installed vY" line with its two buttons; put it anywhere in the UI. */
+function versionLineHtml() {
+    return `<div class="mh_verline">ที่รันอยู่: <b>v${VERSION}</b> <span data-mh-remote></span>
+        <div class="mh_verbtns"><div class="menu_button" data-mh-check><i class="fa-solid fa-rotate"></i> เช็คเวอร์ชัน</div><div class="menu_button" data-mh-reload><i class="fa-solid fa-cloud-arrow-down"></i> โหลดเวอร์ชันล่าสุด</div></div></div>`;
+}
+function showRemoteVersion(scope = document) {
+    const stale = remoteVersion && newerVersion(remoteVersion, VERSION);
+    scope.querySelectorAll('[data-mh-remote]').forEach(el => {
+        el.innerHTML = !remoteVersion ? '' : stale
+            ? `· ติดตั้งไว้ <b>v${esc(remoteVersion)}</b> <span class="mh_stale">ยังไม่ได้โหลด กด “โหลดเวอร์ชันล่าสุด”</span>`
+            : '· เป็นเวอร์ชันล่าสุดที่ติดตั้งไว้แล้ว';
+    });
+}
+async function checkForNewVersion(force = false) {
+    if (!force && Date.now() - versionCheckedAt < 10 * 60_000) return remoteVersion;
+    versionCheckedAt = Date.now();
+    remoteVersion = await fetchRemoteVersion();
+    showRemoteVersion();
+    if (remoteVersion && newerVersion(remoteVersion, VERSION) && !versionToastShown) {
+        versionToastShown = true;
+        globalThis.toastr?.info(`ติดตั้ง v${esc(remoteVersion)} ไว้แล้ว แต่หน้านี้ยังรัน v${VERSION} อยู่<br>แตะที่นี่เพื่อโหลดเวอร์ชันใหม่`, 'Memory Hub', {
+            timeOut: 0, extendedTimeOut: 0, closeButton: true, escapeHtml: false, onclick: () => reloadWithFreshFiles(),
+        });
+    }
+    return remoteVersion;
+}
+async function reloadWithFreshFiles() {
+    try {
+        globalThis.toastr?.info('กำลังดึงไฟล์ใหม่…', 'Memory Hub', { timeOut: 2000 });
+        // cache: 'reload' fetches from the server and overwrites the browser's cached copy,
+        // so the page reload below runs the new files
+        await Promise.all(FILES.map(f => fetch(new URL(f, BASE_URL), { cache: 'reload' }).catch(() => null)));
+    } finally {
+        location.reload();
+    }
+}
+function watchVersion() {
+    document.addEventListener('click', e => {
+        const t = e.target instanceof Element ? e.target : null;
+        if (t?.closest('[data-mh-reload]')) reloadWithFreshFiles();
+        else if (t?.closest('[data-mh-check]')) checkForNewVersion(true);
+    });
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkForNewVersion(); });
+    setTimeout(() => checkForNewVersion(true), 3000);
+}
+
 jQuery(() => {
     try {
         settings();
         renderSettings();
+        watchVersion();
         registerCommands();
         const { eventSource, eventTypes: E } = ctx();
         eventSource.on(E.MESSAGE_RECEIVED, onMessageReceived);
@@ -2679,6 +2751,7 @@ jQuery(() => {
             migrateBotModules();
             reconcile({ announce: true });
             refreshUi();
+            checkForNewVersion();
         });
         console.log(LOG, `v${VERSION} loaded`);
     } catch (e) {
