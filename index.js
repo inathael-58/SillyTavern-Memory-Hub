@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.9.3'; // keep in sync with manifest.json
+const VERSION = '1.10.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -1132,6 +1132,11 @@ async function listOtherChats() {
 }
 
 async function readChatState(id) {
+    return (await readChatFile(id)).state;
+}
+
+/** Memory Hub's state of another chat of this bot, plus its message count. */
+async function readChatFile(id) {
     const c = ctx();
     let res;
     if (c.groupId) {
@@ -1143,7 +1148,7 @@ async function readChatState(id) {
     if (!res.ok) throw new Error(`โหลดแชทไม่ได้ (${res.status})`);
     const data = await res.json();
     const head = Array.isArray(data) ? data[0] : null;
-    return head?.chat_metadata?.[MODULE] ?? null;
+    return { state: head?.chat_metadata?.[MODULE] ?? null, messages: Array.isArray(data) ? Math.max(0, data.length - 1) : 0 };
 }
 
 async function importFromChat(id) {
@@ -1427,10 +1432,20 @@ async function exportDialog() {
       <div class="mh_btns">
         <div class="menu_button mh_ex_md"><i class="fa-brands fa-markdown"></i> Markdown (อ่านง่าย)</div>
         <div class="menu_button mh_ex_json"><i class="fa-solid fa-file-code"></i> JSON (นำเข้ากลับได้)</div>
+      </div>
+      <hr>
+      <h3>ไฟล์สำรอง</h3>
+      <p>เก็บทุกอย่างของ Memory Hub แบบครบ (ความจำ เรื่องย่อ เรื่องย่อย้อนหลังที่ใช้ตอนแตกกิ่ง ช่วงที่ข้ามไว้ สรุปถึงข้อความไหน และโมดูลที่สร้างเอง)
+      กู้คืนได้ที่ <b>นำเข้า → จากไฟล์</b> ข้อความแชทไม่ได้อยู่ในไฟล์นี้ (สำรองแชทด้วยฟีเจอร์ของ SillyTavern)</p>
+      <div class="mh_btns">
+        <div class="menu_button mh_ex_bk_one"><i class="fa-solid fa-floppy-disk"></i> สำรองแชทนี้</div>
+        <div class="menu_button mh_ex_bk_all"><i class="fa-solid fa-box-archive"></i> สำรองทุกแชทของ${isGroup() ? 'กลุ่ม' : 'บอท'}นี้</div>
       </div>`;
     box.addEventListener('click', async e => {
         const t = e.target;
         if (!(t instanceof Element)) return;
+        if (t.closest('.mh_ex_bk_one')) return saveBackup({ all: false });
+        if (t.closest('.mh_ex_bk_all')) return saveBackup({ all: true });
         const md = t.closest('.mh_ex_md');
         const js = t.closest('.mh_ex_json');
         if (!md && !js) return;
@@ -1441,6 +1456,150 @@ async function exportDialog() {
         toast.ok('ส่งออกแล้ว');
     });
     await new c.Popup(box, c.POPUP_TYPE.TEXT, '', { okButton: 'ปิด' }).show();
+}
+
+// ---------------------------------------------------------------- backup + restore
+
+const BACKUP_FORMAT = 'memory-hub-backup';
+const copyOf = x => JSON.parse(JSON.stringify(x ?? null));
+
+/** Full Memory Hub state of this chat, or of every chat of this bot, as one file. */
+async function buildBackup({ all = false } = {}) {
+    const c = ctx();
+    const st = state();
+    const current = c.getCurrentChatId();
+    const chats = [{ chat: current, messages: c.chat.length, state: copyOf(st) }];
+    const failed = [];
+    if (all) {
+        const others = await listOtherChats();
+        let done = 0;
+        const progress = toast.info(`กำลังอ่านแชท 0/${others.length}…`, { timeOut: 0, extendedTimeOut: 0 });
+        try {
+            for (const { id } of others) {
+                try {
+                    const f = await readChatFile(id);
+                    if (f.state?.memories?.length || f.state?.overview) chats.push({ chat: id, messages: f.messages, state: copyOf(f.state) });
+                } catch (e) { console.warn(LOG, e); failed.push(id); }
+                done++;
+                if (progress?.find) progress.find('.toast-message').text(`กำลังอ่านแชท ${done}/${others.length}…`);
+            }
+        } finally { if (progress && window.toastr) window.toastr.clear(progress); }
+    }
+    const s = settings();
+    return {
+        backup: {
+            format: BACKUP_FORMAT,
+            version: VERSION,
+            exportedAt: new Date().toISOString(),
+            bot: botName(),
+            botKey: botKey(),
+            scope: all ? 'bot' : 'chat',
+            chats,
+            customModules: copyOf(s.customModules ?? []),
+        },
+        failed,
+    };
+}
+
+async function saveBackup({ all }) {
+    if (!state()) return toast.warn('เปิดแชทก่อน');
+    try {
+        const { backup, failed } = await buildBackup({ all });
+        const day = backup.exportedAt.slice(0, 10);
+        const name = all ? `memory-hub backup - ${fileSafe(backup.bot)} - ${day}.json` : `memory-hub backup - ${fileSafe(backup.chats[0].chat)}.json`;
+        download(name, JSON.stringify(backup, null, 2), 'application/json');
+        const n = backup.chats.reduce((a, x) => a + (x.state?.memories?.length ?? 0), 0);
+        toast.ok(`สำรองแล้ว ${backup.chats.length} แชท ความจำรวม ${n} ก้อน`);
+        if (failed.length) toast.warn(`อ่านแชทเหล่านี้ไม่ได้ จึงไม่อยู่ในไฟล์: ${failed.join(', ')}`, { timeOut: 10000 });
+    } catch (e) { toast.err(`สำรองไม่สำเร็จ: ${errText(e)}`); }
+}
+
+/** Adds the backup's custom modules this install does not have yet (never overwrites). */
+function restoreCustomModules(list) {
+    const s = settings();
+    const have = new Set((s.customModules ?? []).map(m => m.id));
+    const add = (Array.isArray(list) ? list : []).filter(m => m?.id && !have.has(m.id));
+    if (!add.length) return 0;
+    s.customModules = [...(s.customModules ?? []), ...copyOf(add)];
+    saveSettings();
+    return add.length;
+}
+
+/** Replaces this chat's Memory Hub state with one from a backup. */
+function restoreState(entry) {
+    const c = ctx();
+    const next = copyOf(entry.state);
+    next.memories = Array.isArray(next.memories) ? next.memories.filter(m => m && typeof m.text === 'string') : [];
+    next.overview = String(next.overview ?? '');
+    for (const m of next.memories) m.id ??= uid();
+    c.chatMetadata[MODULE] = next;
+    saveState();
+    reconcile({ announce: true });
+    refreshUi();
+}
+
+/** Lets the user pick a chat from a backup file and restore or append it here. */
+async function restoreDialog(data) {
+    const c = ctx();
+    const st = state();
+    if (!st) return toast.warn('เปิดแชทก่อน');
+    const chats = (Array.isArray(data.chats) ? data.chats : []).filter(x => x?.state && Array.isArray(x.state.memories));
+    if (!chats.length) return toast.warn('ไฟล์สำรองนี้ไม่มีความจำ');
+    const current = c.getCurrentChatId();
+    const pick = Math.max(0, chats.findIndex(x => x.chat === current));
+    const box = document.createElement('div');
+    box.className = 'mh_restore';
+    box.innerHTML = `
+      <h3>กู้คืนจากไฟล์สำรอง</h3>
+      <p>ไฟล์ของ <b>${esc(data.bot ?? '')}</b> สำรองเมื่อ ${esc(String(data.exportedAt ?? '').replace('T', ' ').slice(0, 16))} (${chats.length} แชท)</p>
+      <select class="text_pole mh_rs_chat">${chats.map((x, i) => `<option value="${i}" ${i === pick ? 'selected' : ''}>${esc(x.chat)}${x.chat === current ? ' (แชทนี้)' : ''} — ${x.state.memories.length} ก้อน, ${x.messages ?? '?'} ข้อความ</option>`).join('')}</select>
+      <div class="mh_rs_hint mh_hint"></div>
+      <div class="mh_btns">
+        <div class="menu_button mh_rs_replace"><i class="fa-solid fa-clock-rotate-left"></i> กู้คืน (แทนที่ความจำของแชทนี้)</div>
+        <div class="menu_button mh_rs_merge"><i class="fa-solid fa-forward"></i> นำมาต่อ (เป็นความจำจากแชทก่อน)</div>
+      </div>
+      <small><b>กู้คืน</b> ใช้กับแชทเดียวกับที่สำรองไว้ ได้กลับมาเหมือนตอนสำรองทุกอย่าง
+      <b>นำมาต่อ</b> ใช้กับแชทใหม่ที่ต่อเรื่องจากแชทนั้น ความจำของแชทนี้ยังอยู่ครบ</small>`;
+    const sel = box.querySelector('.mh_rs_chat');
+    const hint = box.querySelector('.mh_rs_hint');
+    const chosen = () => chats[Number(sel.value)] ?? chats[0];
+    const showHint = () => {
+        const x = chosen();
+        const same = x.chat === current;
+        const shorter = (x.messages ?? 0) > c.chat.length;
+        const otherBot = data.botKey && botKey() && data.botKey !== botKey() ? '⚠ ไฟล์นี้เป็นของบอท/กลุ่มอื่น ' : '';
+        hint.innerHTML = otherBot + (same
+            ? (shorter ? `⚠ แชทนี้มี ${c.chat.length} ข้อความ น้อยกว่าตอนสำรอง (${x.messages}) ความจำที่เกินจะถูกถอดออก` : 'แชทเดียวกับในไฟล์ — แนะนำ "กู้คืน"')
+            : `แชทในไฟล์ไม่ใช่แชทนี้ — แนะนำ "นำมาต่อ"${st.memories.length ? '' : ' (หรือ "กู้คืน" ถ้าแชทนี้คือแชทเดิมที่ถูกเปลี่ยนชื่อ)'}`);
+    };
+    sel.addEventListener('change', showHint);
+    showHint();
+    const popup = new c.Popup(box, c.POPUP_TYPE.TEXT, '', { okButton: 'ปิด' });
+    box.addEventListener('click', async e => {
+        const t = e.target;
+        if (!(t instanceof Element)) return;
+        const x = chosen();
+        if (t.closest('.mh_rs_replace')) {
+            if (x.chat !== current || st.memories.length) {
+                const warn = x.chat !== current
+                    ? `แชทในไฟล์ (${esc(x.chat)}) ไม่ใช่แชทนี้ ช่วงข้อความของความจำอาจไม่ตรงกับแชทนี้`
+                    : '';
+                const ok = await c.callGenericPopup(`ความจำ ${st.memories.length} ก้อนและเรื่องย่อของแชทนี้จะถูกแทนที่ด้วยของในไฟล์ ${warn} ทำต่อไหม?`, c.POPUP_TYPE.CONFIRM);
+                if (!ok) return;
+            }
+            restoreState(x);
+            const mods = restoreCustomModules(data.customModules);
+            toast.ok(`กู้คืนแล้ว ${state().memories.length} ก้อน${mods ? ` และโมดูลที่สร้างเอง ${mods} โมดูล` : ''}`);
+            await popup.complete(c.POPUP_RESULT?.AFFIRMATIVE ?? 1);
+        } else if (t.closest('.mh_rs_merge')) {
+            if (x.chat === current) return toast.warn('นี่คือแชทเดียวกับในไฟล์ ใช้ "กู้คืน" แทน');
+            mergeForeign(x.state, x.chat);
+            const mods = restoreCustomModules(data.customModules);
+            if (mods) toast.ok(`เพิ่มโมดูลที่สร้างเอง ${mods} โมดูล`);
+            await popup.complete(c.POPUP_RESULT?.AFFIRMATIVE ?? 1);
+        }
+    });
+    await popup.show();
 }
 
 // ---------------------------------------------------------------- settings panel
@@ -2210,7 +2369,7 @@ async function importDialog() {
       <select class="text_pole mh_chat"><option value="">— เลือกแชท —</option>${chats.map(x => `<option value="${esc(x.id)}">${esc(x.label)}</option>`).join('')}</select>
       <div class="menu_button mh_go_chat">นำเข้าจากแชท</div>
       <hr>
-      <p><b>จากไฟล์ที่ส่งออกไว้</b> (.json ของ Memory Hub)</p>
+      <p><b>จากไฟล์</b> — ไฟล์สำรอง (กู้คืนได้ครบ) หรือ JSON ที่ส่งออกไว้ (.json ของ Memory Hub)</p>
       <label class="menu_button mh_file_btn"><i class="fa-solid fa-file-import"></i> เลือกไฟล์ .json<input type="file" class="mh_file" accept=".json,application/json" hidden></label>
       <hr>
       <p><b>จาก lorebook</b> (เช่น ที่ Memory Books สร้างไว้) — ทุกเอนทรีจะกลายเป็นความจำ แล้วถูกดึงตามความเกี่ยวข้องแทนการติดคีย์เวิร์ด</p>
@@ -2228,8 +2387,9 @@ async function importDialog() {
         if (!file) return;
         try {
             const data = JSON.parse(await file.text());
-            if (data?.format !== 'memory-hub-export' || !Array.isArray(data.memories)) throw new Error('ไม่ใช่ไฟล์ส่งออกของ Memory Hub');
-            mergeForeign(data, data.chat || file.name);
+            if (data?.format === BACKUP_FORMAT) await restoreDialog(data);
+            else if (data?.format === 'memory-hub-export' && Array.isArray(data.memories)) mergeForeign(data, data.chat || file.name);
+            else throw new Error('ไม่ใช่ไฟล์ของ Memory Hub');
         } catch (err) { toast.err(`นำเข้าไฟล์ไม่ได้: ${errText(err)}`); }
         e.target.value = '';
     });
@@ -2484,6 +2644,11 @@ function registerCommands() {
         name: 'memhub-export',
         callback: async () => { await exportDialog(); return ''; },
         helpString: 'Memory Hub: ส่งออกคลังความจำของแชทนี้ (Markdown / JSON)',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'memhub-backup',
+        callback: async (_args, value) => { await saveBackup({ all: lc(value) !== 'chat' }); return ''; },
+        helpString: 'Memory Hub: ดาวน์โหลดไฟล์สำรองความจำของทุกแชทของบอทนี้ (<code>/memhub-backup chat</code> = เฉพาะแชทนี้) กู้คืนที่ นำเข้า → จากไฟล์',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'memhub-continue',
