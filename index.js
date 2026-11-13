@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.10.1'; // keep in sync with manifest.json
+const VERSION = '1.11.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -108,6 +108,7 @@ const DEFAULTS = Object.freeze({
     style: 'modules',       // modules | custom
     defaultModules: null,   // module ids for bots without a choice; null = relationship (solo) / ensemble+story (group)
     botModules: {},         // 'group:<id>' -> module ids (characters keep theirs as tags on the card)
+    offBots: {},            // 'group:<id>' -> true: never summarize on its own (characters use the memhub-off card tag)
     customModules: [],      // user-made modules (same shape as BUILTIN_MODULES)
     autoWords: true,        // add the modules' extra words to the lengths below
     sources: null,          // ordered list: 'main' or Connection Profile ids
@@ -324,7 +325,6 @@ function setBotModules(ids) {
  */
 function tagCard(ch, ids, { quiet = false } = {}) {
     const s = settings();
-    const c = ctx();
     const mods = moduleList();
     const wanted = ids ? mods.filter(m => ids.includes(m.id)) : [];
     const current = botTagNames();
@@ -340,7 +340,13 @@ function tagCard(ch, ids, { quiet = false } = {}) {
         add.push(m.name);
     }
     if (ids && !wanted.length && !current.some(t => lc(t) === BASIC_TAG)) add.push(BASIC_TAG);
+    applyCardTags(ch, add, remove, { quiet });
+}
+
+/** Adds and removes tags on a character: SillyTavern's tag list right away, the card file in the background. */
+function applyCardTags(ch, add, remove, { quiet = false } = {}) {
     if (!add.length && !remove.length) return;
+    const c = ctx();
 
     // SillyTavern's tags (this install)
     const gone = new Set(remove.map(lc));
@@ -405,6 +411,64 @@ function migrateBotModules() {
     saveSettings();
     toast.info(`ย้ายโมดูลที่เลือกไว้ของ ${ch.name} ไปเป็นแท็กบนการ์ดแล้ว เครื่องอื่นที่เปิดการ์ดนี้จะใช้โมดูลชุดเดียวกัน`);
 }
+// ---------------------------------------------------------------- "don't remember" (per chat / per bot)
+//
+// Some bots need no memory at all (a dice roller, a quote bot, a forum that starts a
+// new story every turn). Summarizing them only burns API calls. A chat can be switched
+// off on its own, a character by the card tag memhub-off (travels with the card, so a
+// bot's author can ship it already off), a group in this install's settings.
+// "Off" stops summarizing on its own (automatic), asking (semi-auto) and backlog warnings.
+// Memories that already exist are still used, and "summarize now" still works.
+
+const OFF_TAG = 'memhub-off';
+function botOff() {
+    const key = botKey();
+    if (!key) return false;
+    if (settings().offBots?.[key]) return true;
+    return botTagNames().some(t => lc(t) === OFF_TAG);
+}
+/** Why nothing summarizes here on its own: 'chat', 'bot' or '' (remember as usual). */
+function offReason(st = state()) {
+    if (st?.off) return 'chat';
+    return botOff() ? 'bot' : '';
+}
+const OFF_TH = { chat: 'ไม่จำแชทนี้', bot: 'ไม่จำบอทนี้' };
+
+function setChatOff(on) {
+    const st = state();
+    if (!st) { toast.warn('เปิดแชทก่อน'); return false; }
+    if (on) { st.off = true; delete st.remindAt; } else delete st.off;
+    saveState();
+    return true;
+}
+function setBotOff(on) {
+    const key = botKey();
+    if (!key) { toast.warn('เปิดแชทก่อน'); return false; }
+    const s = settings();
+    const ch = currentChar();
+    if (ch) {
+        const has = botTagNames().filter(t => lc(t) === OFF_TAG);
+        if (on && !has.length) applyCardTags(ch, [OFF_TAG], [], { quiet: true });
+        if (!on && has.length) applyCardTags(ch, [], has, { quiet: true });
+    }
+    if (on && !ch) s.offBots[key] = true; else delete s.offBots[key];
+    saveSettings();
+    return true;
+}
+/** Switches "don't remember" for this chat or this bot, says what it means, refreshes. */
+function toggleOff(scope, on) {
+    const ok = scope === 'bot' ? setBotOff(on) : setChatOff(on);
+    if (!ok) return;
+    const who = scope === 'bot' ? `บอท ${botName()} (ทุกแชท)` : 'แชทนี้';
+    if (on) toast.info(`ไม่จำ${who}แล้ว: จะไม่สรุปเอง ไม่ถาม และไม่เตือน ความจำที่มีอยู่ยังใช้ได้ และกด "สรุปเดี๋ยวนี้" เองได้เสมอ`);
+    else {
+        const still = offReason();
+        toast.info(still ? `กลับมาจำ${who}แล้ว แต่ยัง${OFF_TH[still]}อยู่ จึงยังไม่สรุปเอง` : `กลับมาจำ${who}แล้ว จะสรุปตามโหมดการสรุปตามปกติ`);
+        if (!still) onMessageReceived(null, 'normal');
+    }
+    refreshUi();
+}
+
 const MOD_FROM_TH = { bot: 'เลือกเอง', tags: 'จากแท็กของการ์ด', default: 'ค่าเริ่มต้น' };
 /** Tooltip text: what it remembers, which bots it suits, which tags switch it on. */
 function moduleTip(m) {
@@ -747,7 +811,7 @@ function onMessageReceived(_id, type) {
     const s = settings();
     if (!s.enabled || type === 'quiet') return;
     const st = state();
-    if (!st) return;
+    if (!st || offReason(st)) return;
     const len = ctx().chat.length;
     if (s.mode === 'manual') return warnBacklog(st, len);
     if (len < autoPausedUntil) return;
@@ -761,7 +825,7 @@ const pendingOf = (st, len) => Math.max(0, len - 1 - st.lastEnd);
 /** Unsummarized messages worth a warning when nothing summarizes them on its own. */
 const backlogAt = s => Math.max(40, s.chunkSize * 2);
 function hasBacklog(s, st, len) {
-    return s.enabled && s.mode !== 'auto' && pendingOf(st, len) >= backlogAt(s);
+    return s.enabled && s.mode !== 'auto' && pendingOf(st, len) >= backlogAt(s) && !offReason(st);
 }
 
 let backlogWarned = 0; // pending count at the last manual-mode warning
@@ -790,11 +854,18 @@ async function askToSummarize(st, len) {
           <h3>ถึงรอบสรุปแล้ว</h3>
           <p>ยังไม่สรุป <b>${pendingOf(st, len)}</b> ข้อความ สรุปตอนนี้จะได้ความจำ ${plannedChunks(false, null)} ก้อน (ก้อนละ ${s.chunkSize} ข้อความ) สรุปเลยไหม?</p>
           <label class="mh_row"><span>ถ้ายังไม่สรุป ถามอีกครั้งในอีก (ข้อความ)</span><input type="number" class="text_pole mh_snooze_in" min="1" max="200"></label>
-          <small>ระหว่างที่ยังไม่สรุป ข้อความเหล่านี้ถูกส่งแบบเต็มทุกเทิร์น</small>`;
+          <small>ระหว่างที่ยังไม่สรุป ข้อความเหล่านี้ถูกส่งแบบเต็มทุกเทิร์น</small>
+          <hr>
+          <div><b>บอทนี้ไม่ต้องมีความจำ?</b> (เช่น บอททอยเต๋า บอทที่ขึ้นเรื่องใหม่ทุกเทิร์น)</div>
+          <label class="checkbox_label"><input type="checkbox" class="mh_off_chat_in"> ไม่ต้องจำแชทนี้ (ไม่ถามอีก)</label>
+          <label class="checkbox_label"><input type="checkbox" class="mh_off_bot_in"> ไม่ต้องจำบอท ${esc(botName())} ทุกแชท</label>
+          <small>ติ๊กแล้วกดปุ่มไหนก็ได้ จะไม่สรุป เปลี่ยนกลับได้ที่แผงบนแถบด้านบน หรือ Extensions → Memory Hub</small>`;
         const input = box.querySelector('.mh_snooze_in');
         input.value = s.semiSnooze;
         const ok = await c.callGenericPopup(box, c.POPUP_TYPE.CONFIRM, '', { okButton: 'สรุปเลย', cancelButton: 'ยังก่อน' });
         if (ctx().chatId !== chatId) return;
+        const offBot = box.querySelector('.mh_off_bot_in').checked;
+        if (offBot || box.querySelector('.mh_off_chat_in').checked) return toggleOff(offBot ? 'bot' : 'chat', true);
         if (ok) {
             delete st.remindAt; saveState();
             await runSummaries({});
@@ -1076,6 +1147,7 @@ async function continueInNewChat() {
         baseOverview: old.overview,
         lastEnd: -1,
         chain: [...(old.chain ?? []), oldId],
+        ...(old.off ? { off: true } : {}),
         memories: old.memories.map(m => {
             const { overviewAfter: _drop, ...rest } = m;
             return {
@@ -1636,6 +1708,10 @@ function renderSettings() {
               <option value="manual">สรุปเอง (Manual)</option>
             </select></label>
           <small id="mh_mode_hint" class="mh_hint"></small>
+          <div id="mh_offbox" title="สำหรับบอทที่ไม่ต้องมีความจำ เช่น บอททอยเต๋า บอทคำคม บอทที่ขึ้นเรื่องใหม่ทุกเทิร์น: ไม่สรุปเอง ไม่ถาม และไม่เตือน ความจำที่มีอยู่ยังใช้ได้ และกด &quot;สรุปตอนนี้&quot; เองได้เสมอ">
+            <label class="checkbox_label"><input type="checkbox" id="mh_off_chat"> ไม่ต้องจำแชทนี้</label>
+            <label class="checkbox_label"><input type="checkbox" id="mh_off_bot"> ไม่ต้องจำบอทนี้ทุกแชท <small id="mh_off_botname" class="mh_hint"></small></label>
+          </div>
           <label class="checkbox_label" title="ข้อความที่สรุปแล้วจะไม่ถูกส่งซ้ำ ประหยัดที่สุด แชทจริงไม่ถูกลบหรือซ่อน"><input type="checkbox" id="mh_trim"> ไม่ส่งข้อความที่สรุปแล้ว (ประหยัดโทเคนมากที่สุด)</label>
           <label class="checkbox_label"><input type="checkbox" id="mh_overview"> มี "เรื่องย่อจนถึงตอนนี้" หนึ่งก้อน</label>
           <label class="checkbox_label"><input type="checkbox" id="mh_latest"> ใส่ความจำก้อนล่าสุดเสมอ (ต่อเนื่องกับข้อความดิบ)</label>
@@ -1757,6 +1833,8 @@ function renderSettings() {
         s.mode = mode;
         saveSettings(); refreshUi();
     });
+    $('#mh_off_chat').on('change', function () { toggleOff('chat', this.checked); });
+    $('#mh_off_bot').on('change', function () { toggleOff('bot', this.checked); });
     $('#mh_boost').val(String(s.quotaBoost)).on('change', function () { s.quotaBoost = Number(this.value) || 1; saveSettings(); refreshUi(); });
     bindCheck('#mh_trim', 'trimSummarized');
     bindCheck('#mh_overview', 'overviewEnabled');
@@ -2005,6 +2083,11 @@ function refreshUi() {
         semi: `ทุก ๆ ${s.chunkSize} ข้อความจะขึ้นหน้าต่างถามก่อนสรุป`,
         manual: 'ไม่สรุปเอง กด "สรุปตอนนี้" เมื่อต้องการ (จะเตือนเมื่อค้างเยอะ)',
     }[s.mode] ?? '');
+    const off = st ? offReason(st) : '';
+    if (off) $('#mh_mode_hint').text(`${OFF_TH[off]}: ไม่สรุปเอง ไม่ถาม และไม่เตือน (กด "สรุปตอนนี้" เองได้)`);
+    $('#mh_off_chat').prop({ checked: !!st?.off, disabled: !st });
+    $('#mh_off_bot').prop({ checked: !!st && botOff(), disabled: !st });
+    $('#mh_off_botname').text(st ? `(${botName()}${currentChar() ? ' · เป็นแท็ก memhub-off บนการ์ด' : ''})` : '');
     $('#mh_chunk').siblings('span').text(s.mode === 'manual' ? 'ข้อความต่อความจำหนึ่งก้อน' : s.mode === 'semi' ? 'ถามทุก ๆ (ข้อความ)' : 'สรุปทุก ๆ (ข้อความ)');
     $('#mh_snooze').closest('.mh_row').toggle(s.mode === 'semi');
     $('#mh_bpos').closest('.mh_row').toggle(!['replace', 'replace-badge', 'none'].includes(s.badgeStyle));
@@ -2021,6 +2104,7 @@ function refreshUi() {
         const pending = Math.max(0, len - 1 - st.lastEnd);
         status = `ความจำ <b>${st.memories.length}</b> ก้อน · สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> · ยังไม่สรุป <b>${pending}</b> ข้อความ`;
         if (st.chain?.length) status += ` · ต่อมาจาก ${st.chain.length} แชทก่อนหน้า`;
+        if (off) status += ` · <b>${OFF_TH[off]}</b>`;
         if (busy) status += ' · <i class="fa-solid fa-spinner fa-spin"></i> กำลังทำงาน';
         if (lastInjection) {
             status += `<br>ครั้งล่าสุด: ส่งเรื่องย่อ ${lastInjection.overviewTokens} + ความจำ ${lastInjection.picked.length} ก้อน ${lastInjection.recallTokens} โทเคน`;
@@ -2498,6 +2582,8 @@ async function onTopbarClick(e) {
     else if (a === 'stop') { cancelRequested = true; toast.info('จะหยุดหลังก้อนที่กำลังทำเสร็จ'); }
     else if (a === 'skip') await skipBlocked();
     else if (a === 'gapskip') await skipGaps();
+    else if (a === 'off-chat') toggleOff('chat', !state()?.off);
+    else if (a === 'off-bot') toggleOff('bot', !botOff());
     else if (a === 'resume') { autoPausedUntil = 0; onMessageReceived(null, 'normal'); }
     else if (a === 'mod-del') {
         const id = t.closest('[data-id]')?.dataset.id;
@@ -2546,6 +2632,8 @@ function renderTopbar() {
     const inChat = !!st;
     barBtn.classList.toggle('mh_busy', !!busy);
     barBtn.classList.toggle('mh_hidden', !inChat);
+    const off = inChat && !busy ? offReason(st) : '';
+    barBtn.classList.toggle('mh_off', !!off);
     const badge = barBtn.querySelector('.mh_topbadge');
     if (!inChat) { barPanel.classList.remove('mh_open'); if (ownBar) ownBar.classList.add('mh_hidden'); return; }
     ownBar?.classList.remove('mh_hidden');
@@ -2565,8 +2653,8 @@ function renderTopbar() {
     barBtn.style.setProperty('--mh-fit', String(inPlace && text ? Math.min(1, room / (0.6 * text.length * em)) : 1));
     badge.classList.toggle('mh_bad', !!failed || backlog);
     barBtn.classList.toggle('mh_has_badge', !!badge.textContent);
-    barBtn.title = busy ? `Memory Hub: ${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `Memory Hub: สรุปแล้วถึงข้อความ #${st.lastEnd} · ยังไม่สรุป ${pending}`;
-    if (ownBar) ownBar.querySelector('.mh_ownbar_text').textContent = busy ? `${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : `สรุปถึง #${st.lastEnd} · ค้าง ${pending}`;
+    barBtn.title = busy ? `Memory Hub: ${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : off ? `Memory Hub: ${OFF_TH[off]}` : `Memory Hub: สรุปแล้วถึงข้อความ #${st.lastEnd} · ยังไม่สรุป ${pending}`;
+    if (ownBar) ownBar.querySelector('.mh_ownbar_text').textContent = busy ? `${job?.label ?? 'กำลังทำงาน'} ${job?.range ?? ''}` : off ? OFF_TH[off] : `สรุปถึง #${st.lastEnd} · ค้าง ${pending}`;
 
     applyIcon(barBtn);
     if (!barPanel.classList.contains('mh_open')) return;
@@ -2592,6 +2680,7 @@ function renderTopbar() {
     if (blocked) jobHtml += `<div class="mh_bad">⛔ ช่วง #${blocked.start}–#${blocked.end} ถูกตัวกรองเนื้อหาบล็อก สรุปช่วงถัดไปไม่ได้จนกว่าจะผ่านช่วงนี้ <a href="#" data-mh="skip">ข้ามช่วงนี้ (เขียนเอง)</a></div>`;
     const paused = !busy && s.mode !== 'manual' && autoPausedUntil > len;
     const modeLine = !s.enabled ? 'Memory Hub ปิดอยู่'
+        : off ? `${OFF_TH[off]}: ไม่สรุปเอง ไม่ถาม ไม่เตือน (กด "สรุปเดี๋ยวนี้" เองได้)`
         : paused ? `สรุปอัตโนมัติพักไว้หลังล้มเหลว จนถึงข้อความ #${autoPausedUntil - 1} <a href="#" data-mh="resume">ลองตอนนี้</a>`
         : s.mode === 'manual' ? 'โหมดสรุปเอง: กด "สรุปเดี๋ยวนี้" เมื่อต้องการ'
         : s.mode === 'semi' ? `กึ่งอัตโนมัติ: จะถามก่อนสรุปเมื่อแชทถึงข้อความ #${Math.max(nextAt, (st.remindAt ?? 0) - 1)}`
@@ -2602,6 +2691,9 @@ function renderTopbar() {
       <div class="mh_tp_stat">สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> จากทั้งหมด ${len} · ยังไม่สรุป <b>${pending}</b> · ความจำ ${st.memories.length} ก้อน</div>
       ${s.style === 'custom' ? '<div class="mh_tp_dim">Prompt สรุป: เขียนเองทั้งหมด</div>' : topbarModulesHtml()}
       <div class="mh_tp_dim">${modeLine}</div>
+      <div class="mh_tp_off">ไม่ต้องจำ:
+        <label data-mh="off-chat"><input type="checkbox"${st.off ? ' checked' : ''}> แชทนี้</label>
+        <label data-mh="off-bot"><input type="checkbox"${botOff() ? ' checked' : ''}> ${isGroup() ? 'กลุ่ม' : 'บอท'}นี้ทุกแชท</label></div>
       ${backlog ? `<div class="mh_bad">⚠ ค้าง ${pending} ข้อความ ถูกส่งเต็มทุกเทิร์น และข้อความเก่าอาจหลุดจาก context ก่อนถูกจำ <a href="#" data-mh="now">สรุปเลย</a></div>` : ''}
       ${jobHtml}
       <div class="mh_tp_btns">
@@ -2650,6 +2742,18 @@ function registerCommands() {
         name: 'memhub-backup',
         callback: async (_args, value) => { await saveBackup({ all: lc(value) !== 'chat' }); return ''; },
         helpString: 'Memory Hub: ดาวน์โหลดไฟล์สำรองความจำของทุกแชทของบอทนี้ (<code>/memhub-backup chat</code> = เฉพาะแชทนี้) กู้คืนที่ นำเข้า → จากไฟล์',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'memhub-off',
+        callback: async (_args, value) => {
+            const words = lc(value).split(/\s+/).filter(Boolean);
+            const scope = words.includes('bot') ? 'bot' : 'chat';
+            const now = scope === 'bot' ? botOff() : !!state()?.off;
+            const on = words.includes('on') ? false : words.includes('off') ? true : !now;
+            if (on !== now) toggleOff(scope, on);
+            return '';
+        },
+        helpString: 'Memory Hub: สลับ "ไม่ต้องจำ" ของแชทนี้ (<code>/memhub-off bot</code> = บอทนี้ทุกแชท) ต่อท้ายด้วย <code>off</code> = ไม่จำ, <code>on</code> = กลับมาจำ เช่น <code>/memhub-off bot off</code>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'memhub-continue',
