@@ -236,3 +236,9 @@
 .mh_verbtns { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .mh_verbtns .menu_button { width: auto; margin: 0; font-size: 0.95em; }
 .mh_stale { color: #f5a524; font-weight: 600; }
+
+/* ---------------------------------------------------------------- 1.11 don't remember (per chat / per bot) */
+#mh_topbar_btn.mh_off { opacity: 0.45; }
+#mh_topbar_panel .mh_tp_off { display: flex; flex-wrap: wrap; align-items: center; gap: 0.2em 0.9em; margin: 0.2em 0; }
+#mh_topbar_panel .mh_tp_off label { display: inline-flex; align-items: center; gap: 0.3em; cursor: pointer; }
+#mh_topbar_panel .mh_tp_off input { margin: 0; }
