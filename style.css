@@ -1,5 +1,8 @@
 /* Memory Hub — follows the active SillyTavern theme through its variables. */
 
+/* error texts (JSON, URLs) have no spaces: let them wrap instead of widening the panel */
+.memory-hub-settings, #mh_topbar_panel, .mh_card, .mh_preview { overflow-wrap: anywhere; }
+
 .memory-hub-settings h4 { margin: 0.8em 0 0.3em; }
 .memory-hub-settings .mh_version { opacity: 0.6; font-weight: normal; }
 .memory-hub-settings .mh_status {
