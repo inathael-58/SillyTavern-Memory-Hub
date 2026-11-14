@@ -25,8 +25,11 @@ import { blockKind, cleanKeys, cleanText, findGaps, hasSegmenter, isComplete, ne
 import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords, modulesFromTags } from './modules.js';
 
 const MODULE = 'memory_hub';
+/** Source id: the main API, asked the way a chat turn is (preset, card, messages as turns). */
+const PRESET_SRC = 'main-preset';
+const isBuiltinSource = id => id === 'main' || id === PRESET_SRC;
 const LOG = '[MemoryHub]';
-const VERSION = '1.12.0'; // keep in sync with manifest.json
+const VERSION = '1.13.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -112,7 +115,7 @@ const DEFAULTS = Object.freeze({
     customModules: [],      // user-made modules (same shape as BUILTIN_MODULES)
     autoWords: true,        // add the modules' extra words to the lengths below
     gentle: 'auto',         // intimate/violent scenes in memories: auto (plain only after a content filter) | always | off
-    sources: null,          // ordered list: 'main' or Connection Profile ids
+    sources: null,          // ordered list: 'main', 'main-preset' or Connection Profile ids
     timeoutSec: 120,
     overviewPosition: 'prompt', // 'prompt' | 'chat'
     overviewDepth: 4,
@@ -185,7 +188,7 @@ function settings() {
     ext[MODULE] ??= {};
     const s = ext[MODULE];
     // migrate 1.0.0
-    if (s.sources == null) s.sources = s.source === 'profile' && s.profileId ? [s.profileId, 'main'] : ['main'];
+    if (s.sources == null) s.sources = s.source === 'profile' && s.profileId ? [s.profileId, 'main'] : ['main', PRESET_SRC];
     if (s.style == null && s.prompt != null) s.style = s.prompt.trim() === PROMPT_V1.trim() ? 'modules' : 'custom';
     if (s.prompt != null && s.prompt.trim() === PROMPT_V1.trim()) s.prompt = '';
     // migrate 1.1.0 styles to modules (1.1 raised the lengths for RPG by hand; modules now add them)
@@ -204,6 +207,11 @@ function settings() {
     delete s.autoSummarize;
     for (const [k, v] of Object.entries(DEFAULTS)) if (s[k] === undefined || (k === 'sources' && s[k] == null)) s[k] = v ?? ['main'];
     if (!Array.isArray(s.sources) || !s.sources.length) s.sources = ['main'];
+    // 1.13.0: the untouched default gets the preset route as its fallback, once
+    if (!s.presetSrcAdded) {
+        if (s.sources.length === 1 && s.sources[0] === 'main') s.sources.push(PRESET_SRC);
+        s.presetSrcAdded = true;
+    }
     return s;
 }
 const saveSettings = () => ctx().saveSettingsDebounced();
@@ -512,17 +520,46 @@ function profiles() {
 }
 function sourceLabel(id) {
     if (id === 'main') return 'API หลัก';
+    if (id === PRESET_SRC) return 'API หลัก (ผ่านพรีเซต)';
     const p = profiles().find(x => x.id === id);
     return p ? p.name : '(profile ที่ถูกลบ)';
 }
 function activeSources() {
     const known = new Set(profiles().map(p => p.id));
-    const list = settings().sources.filter(id => id === 'main' || known.has(id));
+    const list = settings().sources.filter(id => isBuiltinSource(id) || known.has(id));
     return list.length ? list : ['main'];
 }
 
-async function callOne(src, messages, maxTokens, timeoutMs) {
+/** Every request sent to a model, for the rescue's budget. */
+let apiCalls = 0;
+/** Set while the preset route runs: the interceptor keeps only these messages. */
+let presetCall = null;
+
+/**
+ * The preset route: a quiet generation of the main API, so the request is
+ * built like a chat turn (preset, card, chat messages as real turns) and
+ * the summary instruction comes last. Only the messages being summarized
+ * are kept (see intercept). Requests without a chat range go the plain way.
+ */
+async function callPreset(messages, maxTokens, timeoutMs, req) {
     const c = ctx();
+    if (!req || typeof c.generateQuietPrompt !== 'function') return callOne('main', messages, maxTokens, timeoutMs);
+    const quiet = [messages[0].content, req.context,
+        `NEW MESSAGES (#${req.start}–#${req.end}) are the roleplay messages above.\nOOC: pause the roleplay. Answer only in the format above, in the story's language.`]
+        .filter(Boolean).join('\n\n');
+    let timer;
+    const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`ไม่ตอบภายใน ${timeoutMs / 1000} วินาที`)), timeoutMs); });
+    presetCall = { start: req.start, end: req.end };
+    apiCalls++;
+    try {
+        return await Promise.race([c.generateQuietPrompt({ quietPrompt: quiet, skipWIAN: true, responseLength: maxTokens, removeReasoning: true }), timeout]);
+    } finally { clearTimeout(timer); presetCall = null; }
+}
+
+async function callOne(src, messages, maxTokens, timeoutMs, req = null) {
+    const c = ctx();
+    apiCalls++;
+    if (src === PRESET_SRC) { apiCalls--; return callPreset(messages, maxTokens, timeoutMs, req); }
     if (src === 'main') {
         let timer;
         const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`ไม่ตอบภายใน ${timeoutMs / 1000} วินาที`)), timeoutMs); });
@@ -557,7 +594,7 @@ let lastCallPartial = false;
  * once on the same API with twice the limit before moving on, and if every
  * API only gives cut-off answers, the longest one is used (flagged).
  */
-async function callModel(system, user, maxTokens, accept = out => !!String(out ?? '').trim(), complete = () => true) {
+async function callModel(system, user, maxTokens, accept = out => !!String(out ?? '').trim(), complete = () => true, req = null) {
     const s = settings();
     const order = activeSources();
     const messages = [{ role: 'system', content: system }, { role: 'user', content: user }];
@@ -570,7 +607,7 @@ async function callModel(system, user, maxTokens, accept = out => !!String(out ?
         let limit = maxTokens;
         for (let round = 0; round < 2; round++) {
             try {
-                const out = await callOne(src, messages, limit, s.timeoutSec * 1000);
+                const out = await callOne(src, messages, limit, s.timeoutSec * 1000, req);
                 if (!String(out ?? '').trim()) throw new Error('ได้คำตอบว่าง (อาจโดน safety filter หรือโควต้าหมด)');
                 if (!accept(out)) throw new Error('คำตอบไม่อยู่ในรูปแบบที่ต้องการ');
                 if (!complete(out)) {
@@ -672,12 +709,14 @@ async function summarizeOnce(start, end, { replaceId = null, updateOverview = tr
     const parts = [];
     if (withOverview) parts.push(`PREVIOUS OVERVIEW:\n${st.overview.trim() || '(none yet — this is the start of the story)'}`);
     if (prev) parts.push(`PREVIOUS MEMORY (for continuity, do not repeat it):\n${memoryBlock(prev)}`);
+    // the preset route sends the messages as chat turns instead of this transcript
+    const req = { start, end, context: ctx().substituteParams(parts.join('\n\n')) };
     parts.push(`NEW MESSAGES (#${start}–#${end}):\n${body}`);
 
     let system = fill(summaryTemplate(), withOverview);
     if (gentle) system += `\n\n${GENTLE_RULE}`;
     const raw = await callModel(system, ctx().substituteParams(parts.join("\n\n")), wordBudget().response,
-        out => !!parseSummary(out).text, out => isComplete(out, { overview: withOverview }));
+        out => !!parseSummary(out).text, out => isComplete(out, { overview: withOverview }), req);
     // flag the memory only when the memory part itself was cut (a missing overview just keeps the old one)
     const partial = lastCallPartial && !isComplete(raw);
     if (ctx().chatId !== chatId) throw new Error('เปลี่ยนแชทระหว่างสรุป ผลลัพธ์ถูกทิ้ง');
@@ -722,8 +761,8 @@ async function summarizeRange(start, end, opt = {}) {
 
 /** A range this small that is still blocked is left as an empty ⛔ memory. */
 const RESCUE_LEAF = 3;
-/** Most summary calls one rescue may spend (free tiers count requests). */
-const RESCUE_CALLS = 10;
+/** Most requests one rescue may send, over all APIs in the list (free tiers count requests). */
+const RESCUE_CALLS = 16;
 /** Split attempts that may fail before anything passes; then the whole range is probably the problem. */
 const RESCUE_GIVE_UP = 3;
 /** Chat whose overview or previous memory seems to be what the filter stops. */
@@ -754,9 +793,9 @@ async function rescueBlocked(start, end, opt, firstError) {
     const gentle = mode !== 'off';
     const chatId = ctx().chatId;
     const range = `#${start}–#${end}`;
-    let calls = 0;
+    const callsAtStart = apiCalls;
+    const spent = () => apiCalls - callsAtStart;
     const attempt = async (a, b, o) => {
-        calls++;
         if (job) { job.range = `#${a}–#${b}`; renderTopbar(); }
         try { return { mem: await summarizeOnce(a, b, { ...opt, ...o }) }; } catch (e) {
             if (!e?.blocked) throw e;
@@ -807,11 +846,11 @@ async function rescueBlocked(start, end, opt, firstError) {
     const walk = async (a, b) => {
         if (cancelRequested || ctx().chatId !== chatId) return;
         const n = b - a + 1;
-        if (n <= RESCUE_LEAF || calls >= RESCUE_CALLS) return hole(a, b);
+        if (n <= RESCUE_LEAF || spent() >= RESCUE_CALLS) return hole(a, b);
         const mid = a + Math.floor(n / 2) - 1;
         for (const [x, y] of [[a, mid], [mid + 1, b]]) {
             if (cancelRequested || ctx().chatId !== chatId) return;
-            if (calls >= RESCUE_CALLS) { hole(x, y); continue; }
+            if (spent() >= RESCUE_CALLS) { hole(x, y); continue; }
             if (prevSize) rangeSize = y - x + 1;
             const r = await attempt(x, y, { gentle, context: true });
             if (r.error) {
@@ -1186,6 +1225,20 @@ async function savedTokens(lastEnd, gaps = []) {
 async function intercept(chat, _contextSize, _abort, type) {
     const s = settings();
     clearPrompts();
+    // our own summary via the preset route: only the messages being summarized
+    if (presetCall && type === 'quiet') {
+        const { start, end } = presetCall;
+        const full = ctx().chat;
+        const keep = new Set();
+        // positions in the prompt chat (system messages are not in it)
+        for (let i = 0, p = 0; i < full.length; i++) {
+            if (full[i].is_system) continue;
+            if (i >= start && i <= end) keep.add(p);
+            p++;
+        }
+        for (let k = chat.length - 1; k >= 0; k--) if (!keep.has(k)) chat.splice(k, 1);
+        return;
+    }
     if (!s.enabled) { lastInjection = null; return; }
 
     // A chunk may be summarizing right now: let it land first, so this prompt
@@ -1944,7 +1997,8 @@ function renderSettings() {
           <div id="mh_sources" class="mh_sources"></div>
           <div class="mh_btns"><div class="menu_button" id="mh_src_add"><i class="fa-solid fa-plus"></i> เพิ่ม API สำรอง</div></div>
           ${numberRow('mh_timeout', 'รอคำตอบนานสุด (วินาที)', 'เกินนี้ถือว่าพัง แล้วไปใช้ตัวถัดไป', 15, 600)}
-          <small class="mh_hint">API สำรองคือ Connection Profile — สร้างที่แท็บ API Connections → Connection Profile (เช่น Google AI Studio หนึ่งอัน, DeepSeek หนึ่งอัน)</small>
+          <small class="mh_hint">API สำรองคือ Connection Profile — สร้างที่แท็บ API Connections → Connection Profile (เช่น Google AI Studio หนึ่งอัน, DeepSeek หนึ่งอัน)<br>
+          "ผ่านพรีเซต" = ส่งคำขอสรุปหน้าตาเหมือนแชทปกติ (พรีเซต การ์ด และข้อความเป็นเทิร์น ๆ) ผ่านตัวกรองได้ดีกว่าเมื่อแชทผ่านแต่สรุปไม่ผ่าน แต่ใช้โทเคนมากกว่า เหมาะเป็นตัวสำรอง</small>
 
           <div class="inline-drawer mh_adv">
             <div class="inline-drawer-toggle inline-drawer-header"><span>ขั้นสูง: ตำแหน่งและข้อความ prompt</span><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
@@ -2063,7 +2117,7 @@ function renderSettings() {
 
     $('#mh_src_add').on('click', () => {
         const used = new Set(s.sources);
-        const next = profiles().find(p => !used.has(p.id))?.id ?? (used.has('main') ? null : 'main');
+        const next = profiles().find(p => !used.has(p.id))?.id ?? ['main', PRESET_SRC].find(id => !used.has(id)) ?? null;
         if (!next) return toast.info('ไม่มี Connection Profile ที่ยังไม่ได้ใช้ สร้างเพิ่มที่แท็บ API Connections ก่อน');
         s.sources.push(next); saveSettings(); renderSources();
     });
@@ -2086,7 +2140,7 @@ function renderSettings() {
 }
 
 function sourceOptions(selected) {
-    const opts = [['main', 'API หลักที่ใช้แชทอยู่'], ...profiles().map(p => [p.id, `Profile: ${p.name}`])];
+    const opts = [['main', 'API หลักที่ใช้แชทอยู่'], [PRESET_SRC, 'API หลัก ผ่านพรีเซต (เหมือนแชทปกติ)'], ...profiles().map(p => [p.id, `Profile: ${p.name}`])];
     if (selected && !opts.some(o => o[0] === selected)) opts.push([selected, '(profile ที่ถูกลบ — จะถูกข้าม)']);
     return opts.map(([v, l]) => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(l)}</option>`).join('');
 }
@@ -2105,7 +2159,7 @@ function renderSourcesOptionsOnly() {
     const sel = this;
     const i = Number(sel.dataset.i);
     const val = settings().sources[i];
-    if (sel.options.length !== profiles().length + 1 + (val !== 'main' && !profiles().some(p => p.id === val) ? 1 : 0)) sel.innerHTML = sourceOptions(val);
+    if (sel.options.length !== profiles().length + 2 + (!isBuiltinSource(val) && !profiles().some(p => p.id === val) ? 1 : 0)) sel.innerHTML = sourceOptions(val);
 }
 
 function renderModulePicker() {
@@ -2279,7 +2333,7 @@ function refreshUi() {
     const c = ctx();
     if (c.extensionPrompts?.['1_memory']?.value?.trim()) warns.push('Summarize ในตัวของ SillyTavern ยังส่งบทสรุปอยู่ ถ้าใช้ Memory Hub แทน ให้ปิดตัวนั้น (Summarize → Pause หรือปิดส่วนขยาย) ไม่งั้นจะเสียโทเคนซ้ำสองทาง');
     if (!hasSegmenter()) warns.push('เบราว์เซอร์นี้ไม่มีตัวตัดคำ (Intl.Segmenter) จะใช้วิธีสำรองซึ่งแม่นน้อยกว่า');
-    const missing = s.sources.filter(id => id !== 'main' && !profiles().some(p => p.id === id));
+    const missing = s.sources.filter(id => !isBuiltinSource(id) && !profiles().some(p => p.id === id));
     if (missing.length) warns.push(`มี Connection Profile ในรายการ API ที่หาไม่เจอ ${missing.length} อัน (จะถูกข้าม)`);
     const gaps = st ? gapsOf(st) : [];
     if (gaps.length) warns.push(gapWarning(gaps));
