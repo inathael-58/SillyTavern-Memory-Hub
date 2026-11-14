@@ -2,6 +2,8 @@
 
 /* error texts (JSON, URLs) have no spaces: let them wrap instead of widening the panel */
 .memory-hub-settings, #mh_topbar_panel, .mh_card, .mh_preview { overflow-wrap: anywhere; }
+/* nothing inside may make the extensions column wider than it is */
+.memory-hub-settings { contain: inline-size; max-width: 100%; }
 
 .memory-hub-settings h4 { margin: 0.8em 0 0.3em; }
 .memory-hub-settings .mh_version { opacity: 0.6; font-weight: normal; }
@@ -32,9 +34,10 @@
     gap: 0.6em;
     margin: 0.2em 0;
 }
-.mh_row > span { flex: 1 1 auto; min-width: 0; }
+.mh_row > span { flex: 1 1 0; min-width: 0; }
 .mh_row > input[type="number"] { flex: 0 0 5.5em; width: 5.5em; margin: 0; }
-.mh_row > select { flex: 0 1 60%; margin: 0; min-width: 0; }
+/* zero basis and width: Safari sizes a select by its longest option otherwise, which can widen the whole panel */
+.mh_row > select { flex: 1.5 1 0; width: 0; margin: 0; min-width: 0; }
 
 .mh_btns { display: flex; flex-wrap: wrap; gap: 0.3em; margin: 0.4em 0; }
 .mh_btns .menu_button { width: auto; flex: 1 1 auto; white-space: nowrap; padding: 0.35em 0.7em; }
@@ -85,7 +88,7 @@
 
 @media (max-width: 600px) {
     .mh_btns .menu_button { flex: 1 1 45%; }
-    .mh_row > select { flex-basis: 55%; }
+    .mh_row > select { flex-grow: 1.2; }
 }
 
 /* ---------------------------------------------------------------- 1.1 */
@@ -95,7 +98,7 @@
 .memory-hub-settings .mh_bad { color: #e5484d; }
 .mh_sources { display: flex; flex-direction: column; gap: 0.3em; margin: 0.3em 0; }
 .mh_src { display: flex; align-items: center; gap: 0.4em; }
-.mh_src select { flex: 1 1 auto; margin: 0; min-width: 0; }
+.mh_src select { flex: 1 1 0; width: 0; margin: 0; min-width: 0; }
 .mh_src .mh_src_n { opacity: 0.7; min-width: 1.4em; }
 .mh_src .mh_icon { cursor: pointer; opacity: 0.6; padding: 0.3em; }
 .mh_src .mh_icon:hover { opacity: 1; }
