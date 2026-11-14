@@ -29,7 +29,7 @@ const MODULE = 'memory_hub';
 const PRESET_SRC = 'main-preset';
 const isBuiltinSource = id => id === 'main' || id === PRESET_SRC;
 const LOG = '[MemoryHub]';
-const VERSION = '1.13.1'; // keep in sync with manifest.json
+const VERSION = '1.13.2'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -1959,10 +1959,11 @@ function renderSettings() {
             </select></label>
           <label class="mh_row" title="ฉากเลิฟซีนหรือความรุนแรงในความจำ: เขียนละเอียดตามปกติ หรือเขียนสั้น ๆ บรรทัดเดียวแบบไม่ลงรายละเอียด (ช่วยให้ไม่ติดตัวกรองเนื้อหา เช่น PROHIBITED_CONTENT ของ Gemini)"><span>ฉากแรง / เลิฟซีนในความจำ</span>
             <select id="mh_gentle" class="text_pole">
-              <option value="auto">ละเอียดตามปกติ เขียนแบบเบาเมื่อติดตัวกรอง (แนะนำ)</option>
-              <option value="always">เขียนแบบเบาเสมอ (Lite)</option>
-              <option value="off">ละเอียดเสมอ ไม่สลับให้</option>
+              <option value="auto">ปกติ · เบาเมื่อติดตัวกรอง</option>
+              <option value="always">เบาเสมอ (Lite)</option>
+              <option value="off">ละเอียดเสมอ</option>
             </select></label>
+          <small class="mh_hint">แบบเบา = เขียนฉากเลิฟซีน/ความรุนแรงสั้น ๆ บรรทัดเดียว ไม่ลงรายละเอียด ช่วยให้ไม่ติดตัวกรองเนื้อหา ค่าแนะนำคือ "ปกติ · เบาเมื่อติดตัวกรอง"</small>
           <div id="mh_modbox" class="mh_modbox">
             <div class="mh_modhead"><b>โมดูลของบอทนี้:</b> <span id="mh_botname"></span></div>
             <small id="mh_modsrc" class="mh_hint"></small>
@@ -2140,7 +2141,7 @@ function renderSettings() {
 }
 
 function sourceOptions(selected) {
-    const opts = [['main', 'API หลักที่ใช้แชทอยู่'], [PRESET_SRC, 'API หลัก ผ่านพรีเซต (เหมือนแชทปกติ)'], ...profiles().map(p => [p.id, `Profile: ${p.name}`])];
+    const opts = [['main', 'API หลักที่ใช้แชทอยู่'], [PRESET_SRC, 'API หลัก ผ่านพรีเซต'], ...profiles().map(p => [p.id, `Profile: ${p.name}`])];
     if (selected && !opts.some(o => o[0] === selected)) opts.push([selected, '(profile ที่ถูกลบ — จะถูกข้าม)']);
     return opts.map(([v, l]) => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(l)}</option>`).join('');
 }
