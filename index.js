@@ -11,6 +11,10 @@
  *      one (continuity), pinned ones, and the best BM25 matches for the last
  *      few messages, all under a token budget. No vector setup; Thai text is
  *      split with the browser's word breaker (see lib.js).
+ *   4. Long chats (2.0): every ~10 memories are folded into one arc (ภาค), the
+ *      model choosing where the part of the story ends. Arcs are recalled like
+ *      memories, and the story-so-far is written again from the arcs each time
+ *      one is made, so it cannot drift over hundreds of rewrites.
  *
  * Everything lives in the chat's metadata. SillyTavern copies metadata into
  * branches; reconcile() then drops the memories past the branch point and
@@ -21,15 +25,15 @@
  * Profiles); when one fails, times out or answers empty, the next is tried.
  */
 
-import { blockKind, cleanKeys, cleanText, findGaps, hasSegmenter, isComplete, nextChunk, parseMany, parseSummary, rankMemories } from './lib.js';
-import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords, modulesFromTags } from './modules.js';
+import { ageTag, arcBounds, blockKind, clampCut, cleanKeys, cleanText, estimateArcs, findGaps, hasSegmenter, isComplete, nextChunk, normalizeArcs, parseArc, parseMany, parseSummary, planArcStep, rankMemories } from './lib.js';
+import { allModules, BUILTIN_MODULES, buildArcPrompt, buildOverviewRule, buildPrompt, extraWords, modulesFromTags } from './modules.js';
 
 const MODULE = 'memory_hub';
 /** Source id: the main API, asked the way a chat turn is (preset, card, messages as turns). */
 const PRESET_SRC = 'main-preset';
 const isBuiltinSource = id => id === 'main' || id === PRESET_SRC;
 const LOG = '[MemoryHub]';
-const VERSION = '1.13.2'; // keep in sync with manifest.json
+const VERSION = '2.0.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -92,6 +96,9 @@ Answer in exactly this format and nothing else:
 ...
 </overview>`;
 
+const RECALL_TEMPLATE_V1 = '[Memories from earlier in the story that matter now]\n{{memories}}';
+const RECALL_TEMPLATE = '[Memories from earlier in the story that matter now. Older ones may be outdated: when one conflicts with the story so far or a newer memory, the newer one wins.]\n{{memories}}';
+
 const DEFAULTS = Object.freeze({
     enabled: true,
     mode: 'auto',           // auto | semi (ask first) | manual
@@ -108,6 +115,11 @@ const DEFAULTS = Object.freeze({
     recallBudget: 800,      // tokens for recalled memories (overview not counted)
     queryDepth: 4,          // last N messages used to decide what to recall
     includeLatest: true,
+    arcSize: 10,            // memories per arc (ภาค); 0 = no arcs
+    arcFlexible: true,      // the model picks where an arc ends, between half and 1.5x arcSize
+    arcRecall: 1,           // arcs recalled per turn, on top of the memories
+    arcWords: 250,          // arc length for 10 memories; grows with the arc and with the memory length
+    arcBudget: 800,         // tokens per recalled arc of the standard size
     style: 'modules',       // modules | custom
     defaultModules: null,   // module ids for bots without a choice; null = relationship (solo) / ensemble+story (group)
     botModules: {},         // 'group:<id>' -> module ids (characters keep theirs as tags on the card)
@@ -124,7 +136,7 @@ const DEFAULTS = Object.freeze({
     maxMessageChars: 3000,  // per message, in the summarizer's input
     prompt: '',             // used when style = custom
     overviewTemplate: '[Story so far]\n{{overview}}',
-    recallTemplate: '[Memories from earlier in the story that matter now]\n{{memories}}',
+    recallTemplate: RECALL_TEMPLATE,
     notify: true,
     carrySummarizeRest: true,
     topbar: true,           // button + panel in the chat top bar (Top Info Bar extension)
@@ -202,6 +214,8 @@ function settings() {
     if (s.style === 'auto') s.style = 'modules';
     // migrate 1.7.0: the plain-number badge was hard to read
     if (s.badgeStyle === 'plain') s.badgeStyle = 'badge';
+    // 2.0.0: the untouched recall template also says that newer memories win
+    if (s.recallTemplate === RECALL_TEMPLATE_V1) s.recallTemplate = RECALL_TEMPLATE;
     // migrate 1.5.x: the on/off switch became a mode
     if (s.mode == null && s.autoSummarize === false) s.mode = 'manual';
     delete s.autoSummarize;
@@ -216,7 +230,7 @@ function settings() {
 }
 const saveSettings = () => ctx().saveSettingsDebounced();
 
-/** @returns {{v:number, memories:any[], overview:string, lastEnd:number, skips?:Array<[number, number]>, baseOverview?:string, chain?:string[]}|null} */
+/** @returns {{v:number, memories:any[], arcs:any[], overview:string, lastEnd:number, skips?:Array<[number, number]>, baseOverview?:string, chain?:string[]}|null} */
 function state() {
     const c = ctx();
     if (!c.chatId) return null;
@@ -225,6 +239,7 @@ function state() {
     meta[MODULE] ??= { v: 1, memories: [], overview: '', lastEnd: -1 };
     const st = meta[MODULE];
     st.memories ??= [];
+    if (!Array.isArray(st.arcs)) st.arcs = [];
     st.overview ??= '';
     if (!Number.isInteger(st.lastEnd)) st.lastEnd = -1;
     return st;
@@ -505,6 +520,25 @@ function wordBudget({ boost, size } = {}) {
     // longer memories need a bigger recall budget to fit the same number of them
     const recall = Math.round(s.recallBudget * memory / Math.max(1, s.memoryWords));
     return { memory, overview, response, bullets, recall, per };
+}
+
+/**
+ * Sizes and lengths of arcs for the current settings. An arc grows with the
+ * number of memories in it, and with the memories themselves (modules, chunk
+ * size, quota boost), the same way a memory grows with its messages.
+ */
+function arcPlan() {
+    const s = settings();
+    const w = wordBudget();
+    const b = arcBounds(s.arcSize || DEFAULTS.arcSize);
+    const perMem = (s.arcWords / 10) * (w.memory / Math.max(1, s.memoryWords));
+    const wordsFor = n => Math.max(60, Math.round(perMem * n));
+    const bulletsFor = n => Math.min(30, Math.max(4, Math.round(wordsFor(n) / 25)));
+    const maxN = s.arcFlexible ? b.max : b.target;
+    const responseFor = (n, withOverview) => Math.max(s.responseLength, Math.ceil((wordsFor(n) + (withOverview ? w.overview : 0)) * 5 + 400));
+    // tokens for one recalled arc: arcBudget for the standard arc of 10, more for a bigger one
+    const slot = Math.round(s.arcBudget * wordsFor(maxN) / Math.max(1, wordsFor(10)));
+    return { ...b, maxN, wordsFor, bulletsFor, responseFor, slot, recall: slot * Math.max(0, s.arcRecall) };
 }
 
 // ---------------------------------------------------------------- model calls (with fallback chain)
@@ -951,6 +985,8 @@ function runSummaries({ force = false, quiet = false, keepRaw = null } = {}) {
         }
         if (made && (settings().notify || !quiet)) toast.ok(`สร้างความจำใหม่ ${made} ก้อน`);
         if (!made && !failed && !quiet && !cancelRequested) toast.info('ยังไม่มีข้อความที่ต้องสรุป (ข้อความล่าสุดจะถูกเก็บไว้แบบเต็มตามที่ตั้งไว้)');
+        // after the caller's own follow-up (e.g. "continue in a new chat") had its turn
+        if (made && !failed) setTimeout(maybeArcs, 0);
         return { made, failed };
     })();
     return busy;
@@ -1002,7 +1038,7 @@ function onMessageReceived(_id, type) {
     const len = ctx().chat.length;
     if (s.mode === 'manual') return warnBacklog(st, len);
     if (len < autoPausedUntil) return;
-    if (!nextChunk(st.lastEnd, len, s.chunkSize, s.keepRaw)) return;
+    if (!nextChunk(st.lastEnd, len, s.chunkSize, s.keepRaw)) return maybeArcs();
     if (s.mode === 'semi') return askToSummarize(st, len);
     runSummaries({ quiet: true });
 }
@@ -1119,6 +1155,11 @@ function reconcile({ announce = false } = {}) {
         if (announce) toast.info(`แชทนี้สั้นกว่าที่ความจำครอบคลุม (เช่น แตกกิ่ง) — ถอดความจำหลังจุดนั้นออก ${dropped} ก้อน และย้อนเรื่องย่อกลับไปตามจุดนั้นแล้ว`, { timeOut: 8000 });
     }
     if (st.lastEnd > len - 1) { st.lastEnd = len - 1; changed = true; }
+    // arcs past a branch point go; their memories that are left get folded again
+    const arcsBefore = st.arcs.length;
+    st.arcs = st.arcs.filter(a => !(a.end > len - 1));
+    if (st.arcs.length !== arcsBefore) changed = true;
+    if (syncArcs(st)) changed = true;
     if (st.skips?.length) {
         const kept = st.skips.filter(([, b]) => b <= len - 1);
         if (kept.length !== st.skips.length) { st.skips = kept; changed = true; }
@@ -1153,6 +1194,375 @@ function gapsOf(st) {
 }
 const gapLabel = ([a, b]) => a === b ? `#${a}` : `#${a}–#${b}`;
 
+// ---------------------------------------------------------------- arcs (ภาค)
+//
+// Every ~arcSize memories become one arc. Arcs hold the oldest memories first and
+// never overlap (lib.js planArcStep decides what is due). The memories stay as
+// they are; an arc is one more thing that can be recalled, and making one also
+// writes the story-so-far again from the arcs, so it cannot drift.
+
+const arcsOn = () => (Number(settings().arcSize) || 0) >= 2;
+
+/** Memories an arc may hold, in story order: carried ones from earlier chats, then this chat's chunks. */
+function arcUnits(st) {
+    const ok = m => String(m.text ?? '').trim();
+    const carry = st.memories.filter(m => m.source === 'carry' && ok(m));
+    const own = st.memories.filter(m => m.source === 'auto' && ok(m)).sort((a, b) => (a.start - b.start) || (a.ts - b.ts));
+    return [...carry, ...own];
+}
+
+/** Message range of an arc (its own chunks), and whether it holds memories from an earlier chat. */
+function fillArcRange(st, a, byId = new Map(st.memories.map(m => [m.id, m]))) {
+    const ms = a.members.map(id => byId.get(id)).filter(Boolean);
+    const own = ms.filter(m => m.source === 'auto' && m.end >= 0);
+    a.start = own.length ? Math.min(...own.map(m => m.start)) : -1;
+    a.end = own.length ? Math.max(...own.map(m => m.end)) : -1;
+    a.source = own.length ? 'auto' : 'carry';
+    if (ms.some(m => m.source === 'carry')) a.carried = true; else delete a.carried;
+}
+
+/** Drops members that are gone (the arc must be written again), puts everything in story order. */
+function syncArcs(st) {
+    const { arcs, changed } = normalizeArcs(arcUnits(st).map(m => m.id), st.arcs);
+    if (!changed) return false;
+    st.arcs = arcs;
+    const byId = new Map(st.memories.map(m => [m.id, m]));
+    for (const a of arcs) fillArcRange(st, a, byId);
+    return true;
+}
+
+const arcOf = (st, memId) => st.arcs.find(a => a.members.includes(memId)) ?? null;
+/** A memory inside an arc was summarized again: the arc must follow. */
+function markArcStale(st, memId) {
+    const a = arcOf(st, memId);
+    if (a) { a.stale = true; delete a.edited; }
+    return a;
+}
+
+function nextArcStep(st, force = false) {
+    if (syncArcs(st)) saveState();
+    const s = settings();
+    return planArcStep({ units: arcUnits(st).map(m => m.id), arcs: st.arcs, target: s.arcSize, flexible: !!s.arcFlexible, force });
+}
+
+/** What is waiting: memories after the last arc, stale arcs, and roughly how many arcs a run would make. */
+function arcBacklog(st, force = false) {
+    const s = settings();
+    const units = arcUnits(st);
+    const held = new Set(st.arcs.flatMap(a => a.members));
+    let waiting = 0;
+    for (let i = units.length - 1; i >= 0 && !held.has(units[i].id); i--) waiting++;
+    const stale = st.arcs.filter(a => a.stale).length;
+    const step = arcsOn() ? nextArcStep(st, force) : null;
+    const b = arcBounds(s.arcSize);
+    const trigger = force ? b.min : s.arcFlexible ? b.max : b.target;
+    const est = step && waiting >= trigger ? estimateArcs(waiting, s.arcSize) : [0, 0];
+    return { step, waiting, stale, est, units: units.length };
+}
+
+/** Newer arcs whole, older ones shortened to title + first lines, within about `budget` tokens. */
+async function compactArcs(arcs, budget = 6000) {
+    const out = [];
+    let used = 0;
+    for (const a of [...arcs].reverse()) {
+        const full = memoryBlock(a);
+        const t = await countTokens(full);
+        if (used + t <= budget || !out.length) { out.unshift(full); used += t; continue; }
+        const short = `• ${a.title ? a.title + ': ' : ''}${String(a.text ?? '').trim().split('\n').slice(0, 2).join(' ')}`;
+        out.unshift(short);
+        used += await countTokens(short);
+    }
+    return out.join('\n');
+}
+
+const memRange = m => m.end >= 0 ? `(#${m.start}–#${m.end})` : m.source === 'carry' ? '(earlier chat)' : '';
+
+function fillArc(template, { min, max, withOverview }) {
+    const p = arcPlan();
+    const span = (f, sep) => (min === max ? String(f(max)) : `${f(min)}${sep}${f(max)}`);
+    const t = String(template)
+        .replaceAll('{{arc_min}}', String(min))
+        .replaceAll('{{arc_max}}', String(max))
+        .replaceAll('{{arc_words}}', span(p.wordsFor, '–'))
+        .replaceAll('{{arc_bullets}}', span(p.bulletsFor, '–'))
+        .replaceAll('{{overview_rule}}', withOverview ? buildOverviewRule(activeModules(), { anchor: true }) : '')
+        .replaceAll('{{overview_format}}', withOverview ? OVERVIEW_FORMAT : '')
+        .replaceAll('{{overview_words}}', String(wordBudget().overview));
+    return ctx().substituteParams(t);
+}
+
+/**
+ * Folds memories step.ids[0..cut-1] into one arc (or writes arc `arcId` again).
+ * With `step.anchor`, the same call writes the story-so-far again from the arcs.
+ * @returns {Promise<{arc:any, cut:number, anchored:boolean}>}
+ */
+async function makeArc(step, { arcId = null } = {}) {
+    const s = settings();
+    const st = state();
+    if (!st) throw new Error('ยังไม่ได้เปิดแชท');
+    const chatId = ctx().chatId;
+    const byId = new Map(st.memories.map(m => [m.id, m]));
+    const mems = step.ids.map(id => byId.get(id)).filter(Boolean);
+    if (!mems.length) throw new Error('ไม่มีความจำให้รวม');
+    const rest = (step.rest ?? []).map(id => byId.get(id)).filter(Boolean);
+    const fixed = step.min === step.max;
+    const withOverview = !!(s.overviewEnabled && step.anchor);
+    const order = new Map(arcUnits(st).map((m, i) => [m.id, i]));
+    const firstAt = order.get(step.ids[0]) ?? 0;
+    const before = st.arcs.filter(a => a.id !== arcId && (order.get(a.members[0]) ?? 0) < firstAt);
+
+    const parts = [];
+    if (withOverview) {
+        parts.push(`PREVIOUS OVERVIEW:\n${st.overview.trim() || '(none yet)'}`);
+        if (before.length) parts.push(`EARLIER ARCS (story order):\n${await compactArcs(before)}`);
+    } else if (before.length) {
+        parts.push(`PREVIOUS ARC (for continuity, do not repeat it):\n${memoryBlock(before.at(-1))}`);
+    }
+    parts.push(`MEMORIES (story order):\n${mems.map((m, i) => `[${i + 1}] ${memRange(m)} ${memoryBlock(m).replace(/^• /, '')}`).join('\n\n')}`);
+    if (withOverview && rest.length) parts.push(`LATER MEMORIES (newer than MEMORIES; for the overview only, never part of the arc):\n${rest.map(memoryBlock).join('\n')}`);
+    const user = ctx().substituteParams(parts.join('\n\n'));
+
+    const p = arcPlan();
+    const ask = async gentle => {
+        let system = fillArc(buildArcPrompt(activeModules(), { group: isGroup(), fixed }), { min: step.min, max: step.max, withOverview });
+        if (gentle) system += `\n\n${GENTLE_RULE}`;
+        return callModel(system, user, p.responseFor(step.max, withOverview),
+            out => !!parseArc(out).text, out => isComplete(out, { memory: false, arc: true, overview: withOverview }));
+    };
+    let gentle = s.gentle === 'always';
+    let raw;
+    try { raw = await ask(gentle); } catch (e) {
+        if (!e?.blocked || gentle || s.gentle === 'off') throw e;
+        gentle = true;
+        raw = await ask(true);
+    }
+    const partial = lastCallPartial && !isComplete(raw, { memory: false, arc: true });
+    if (ctx().chatId !== chatId) throw Object.assign(new Error('เปลี่ยนแชทระหว่างรวมภาค ผลลัพธ์ถูกทิ้ง'), { chatChanged: true });
+
+    const parsed = parseArc(raw);
+    const fallback = Math.min(step.max, Math.max(step.min, p.target));
+    const cut = fixed ? step.max : clampCut(parsed.cut, step.min, step.max, fallback);
+    const members = step.ids.slice(0, cut);
+    const cur = state();
+    let keys = cleanKeys(parsed.keys, mainNames());
+    if (!keys.length) {
+        // the members' own keys, most frequent first
+        const count = new Map();
+        for (const id of members) for (const k of byId.get(id)?.keys ?? []) count.set(k, (count.get(k) ?? 0) + 1);
+        keys = [...count].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k]) => k);
+    }
+    let arc = arcId ? cur.arcs.find(a => a.id === arcId) : null;
+    const fields = {
+        members, title: parsed.title || arc?.title || `ภาค ${cur.arcs.length + 1}`, keys, text: parsed.text, ts: Date.now(),
+        cutBy: fixed ? 'fixed' : parsed.cut === cut ? 'ai' : 'auto',
+    };
+    if (arc) {
+        Object.assign(arc, fields);
+        for (const k of ['stale', 'edited', 'truncated', 'gentle']) delete arc[k];
+    } else {
+        arc = { id: uid(), pinned: false, ...fields };
+        cur.arcs.push(arc);
+    }
+    if (partial) arc.truncated = true;
+    if (gentle) arc.gentle = true;
+    syncArcs(cur);
+    fillArcRange(cur, arc);
+    let anchored = false;
+    if (withOverview && parsed.overview) {
+        cur.overview = parsed.overview;
+        // a branch made after this point gets this story-so-far back
+        const last = latestOf(cur.memories.filter(m => m.source === 'auto'));
+        if (last) last.overviewAfter = parsed.overview;
+        anchored = true;
+    }
+    saveState();
+    return { arc, cut, anchored };
+}
+
+const PROMPT_ANCHOR = `You keep the "story so far" of an ongoing roleplay between {{user}} and {{char}}.
+Below are the arcs of the story and the memories after them, in story order.
+Write in the same language as the story.
+{{overview_rule}}
+Answer in exactly this format and nothing else:
+<overview>
+...
+</overview>`;
+
+/** Writes the story-so-far again from all arcs and the memories after them (one call). */
+async function anchorOverview() {
+    const st = state();
+    if (!st) return false;
+    const chatId = ctx().chatId;
+    const held = new Set(st.arcs.flatMap(a => a.members));
+    const after = arcUnits(st).filter(m => !held.has(m.id));
+    const parts = [`PREVIOUS OVERVIEW:\n${st.overview.trim() || '(none yet)'}`];
+    if (st.arcs.length) parts.push(`EARLIER ARCS (story order):\n${await compactArcs(st.arcs)}`);
+    if (after.length) parts.push(`MEMORIES (after the arcs, story order):\n${after.map(memoryBlock).join('\n')}`);
+    const system = ctx().substituteParams(String(PROMPT_ANCHOR)
+        .replaceAll('{{overview_rule}}', buildOverviewRule(activeModules(), { anchor: true }))
+        .replaceAll('{{overview_words}}', String(wordBudget().overview)));
+    const raw = await callModel(system, ctx().substituteParams(parts.join('\n\n')), wordBudget().response,
+        out => !!parseSummary(out).overview, out => isComplete(out, { memory: false, overview: true }));
+    const overview = parseSummary(raw).overview;
+    if (!overview || ctx().chatId !== chatId) return false;
+    const cur = state();
+    cur.overview = overview;
+    const last = latestOf(cur.memories.filter(m => m.source === 'auto'));
+    if (last) last.overviewAfter = overview;
+    saveState();
+    return true;
+}
+
+let arcPause = null; // { chatId, units }: arcs wait after a failure until more memories exist
+
+/**
+ * Makes and rewrites arcs until nothing is due.
+ * @param {{force?:boolean, quiet?:boolean}} opt force = also fold the newest memories once half an arc waits
+ */
+function runArcs({ force = false, quiet = false } = {}) {
+    if (!arcsOn()) {
+        if (!quiet) toast.info('ปิดระบบภาคอยู่ (ตั้ง "รวมเป็นภาคทุก" เป็น 0) เปิดได้ที่ Extensions → Memory Hub → ภาค');
+        return Promise.resolve({ made: 0, rebuilt: 0, failed: false });
+    }
+    if (busy) {
+        queued++; renderTopbar();
+        return busy.then(() => { queued = Math.max(0, queued - 1); return runArcs({ force, quiet }); });
+    }
+    const st0 = state();
+    if (!st0) return Promise.resolve({ made: 0, rebuilt: 0, failed: false });
+    cancelRequested = false;
+    const chatId = ctx().chatId;
+    const due = arcBacklog(st0, force);
+    busy = (async () => {
+        let made = 0, rebuilt = 0, failed = false, anchored = false, tailMade = false;
+        let progress = null;
+        job = { kind: 'arc', label: 'รวมเป็นภาค', done: 0, total: Math.max(1, due.stale + due.est[1]) };
+        renderTopbar();
+        try {
+            for (let guard = 0; guard < 1000; guard++) {
+                if (cancelRequested || ctx().chatId !== chatId) break;
+                const st = state();
+                if (!st) break;
+                const step = nextArcStep(st, force);
+                if (!step) break;
+                if (step.type === 'attach') {
+                    const a = st.arcs.find(x => x.id === step.arcId);
+                    if (!a) break;
+                    a.members.push(...step.ids);
+                    a.stale = true;
+                    syncArcs(st);
+                    saveState();
+                    continue;
+                }
+                job.total = Math.max(job.total, job.done + 1);
+                let res;
+                if (step.type === 'rebuild') {
+                    const a = st.arcs.find(x => x.id === step.arcId);
+                    job.label = 'สร้างภาคใหม่';
+                    job.range = a?.title ?? '';
+                    renderTopbar();
+                    res = await makeArc({ ids: a.members, min: a.members.length, max: a.members.length, tail: false, rest: [] }, { arcId: a.id });
+                    rebuilt++;
+                } else {
+                    // the story-so-far is written in the same call when this is surely the last arc of the run
+                    const s = settings();
+                    const b = arcBounds(s.arcSize);
+                    const waiting = step.ids.length + step.rest.length;
+                    const trigger = force ? b.min : s.arcFlexible ? b.max : b.target;
+                    step.anchor = step.tail && waiting - step.min < trigger;
+                    job.label = 'รวมเป็นภาค';
+                    job.range = `ความจำ ${step.ids.length} ก้อน`;
+                    renderTopbar();
+                    res = await makeArc(step);
+                    made++;
+                    if (step.tail) { tailMade = true; anchored = res.anchored; }
+                }
+                job.done++;
+                if (!quiet && !barPanel?.classList.contains('mh_open')) {
+                    if (progress) globalThis.toastr?.clear(progress);
+                    progress = toast.info(`${step.type === 'rebuild' ? 'สร้างภาคใหม่' : 'รวมเป็นภาค'} "${res.arc.title}" (${res.arc.members.length} ก้อน)…`, { timeOut: 0, extendedTimeOut: 0 });
+                }
+                refreshUi();
+            }
+            if (tailMade && !anchored && settings().overviewEnabled && !cancelRequested && ctx().chatId === chatId) {
+                job.label = 'เขียนเรื่องย่อใหม่จากภาค'; job.range = ''; renderTopbar();
+                await anchorOverview();
+            }
+        } catch (e) {
+            if (!e?.chatChanged) {
+                failed = true;
+                console.error(LOG, e);
+                arcPause = { chatId, units: arcUnits(state() ?? { memories: [] }).length + 1 };
+                lastJob = { ok: false, text: `รวมเป็นภาคไม่สำเร็จ: ${failText(e, 'นี้')}`, at: Date.now() };
+                toast.err(`รวมเป็นภาคไม่สำเร็จ (ความจำทุกก้อนยังอยู่ครบ จะลองใหม่เมื่อมีความจำก้อนถัดไป หรือกด "รวมเป็นภาค" ในคลังความจำ):\n${errText(e)}`, { timeOut: 15000 });
+            }
+        } finally {
+            if (progress) globalThis.toastr?.clear(progress);
+            busy = null;
+            job = null;
+            if ((made || rebuilt) && !failed) lastJob = { ok: true, text: [made && `รวมเป็นภาคใหม่ ${made} ภาค`, rebuilt && `สร้างภาคใหม่ ${rebuilt} ภาค`].filter(Boolean).join(' · '), at: Date.now() };
+            refreshUi();
+        }
+        if ((made || rebuilt) && (settings().notify || !quiet)) toast.ok([made && `รวมเป็นภาคใหม่ ${made} ภาค`, rebuilt && `สร้างภาคใหม่ ${rebuilt} ภาค`, (anchored || tailMade) && 'เขียนเรื่องย่อใหม่จากภาคแล้ว'].filter(Boolean).join(' · '));
+        if (!made && !rebuilt && !failed && !quiet && !cancelRequested) {
+            const b = arcBounds(settings().arcSize);
+            toast.info(`ยังไม่มีอะไรต้องรวม ความจำที่ยังไม่เข้าภาคมี ${arcBacklog(state() ?? { memories: [], arcs: [] }).waiting} ก้อน (ต้องมีอย่างน้อย ${b.min} ก้อน)`);
+        }
+        return { made, rebuilt, failed };
+    })();
+    return busy;
+}
+
+let arcAsking = false;
+/**
+ * Called after summaries, on opening a chat and after edits: runs what is due.
+ * Automatic mode does it quietly, unless it would make several arcs at once
+ * (an old long chat): then it asks first, as semi-auto mode always does.
+ */
+function maybeArcs() {
+    const s = settings();
+    if (!s.enabled || !arcsOn() || busy || arcAsking || s.mode === 'manual') return;
+    const st = state();
+    if (!st || offReason(st)) return;
+    const due = arcBacklog(st);
+    if (!due.step) return;
+    if (arcPause?.chatId === ctx().chatId && due.units < arcPause.units) return;
+    const big = due.stale + due.est[1] > 2;
+    if (s.mode === 'auto' && !big) { runArcs({ quiet: true }); return; }
+    if (due.units < (st.arcSnooze ?? 0)) return;
+    askArcs(due);
+}
+
+async function askArcs(due) {
+    arcAsking = true;
+    try {
+        const c = ctx();
+        const chatId = c.chatId;
+        const s = settings();
+        const st = state();
+        const b = arcBounds(s.arcSize);
+        const [lo, hi] = due.est;
+        const parts = [];
+        if (due.est[1]) parts.push(`มีความจำที่ยังไม่อยู่ในภาค <b>${due.waiting}</b> ก้อน รวมเป็นภาคได้ประมาณ <b>${lo === hi ? lo : `${lo}–${hi}`}</b> ภาค`);
+        if (due.stale) parts.push(`มีภาคที่ต้องสร้างใหม่ <b>${due.stale}</b> ภาค (ความจำข้างในถูกลบหรือสรุปใหม่)`);
+        const box = document.createElement('div');
+        box.className = 'mh_carry';
+        box.innerHTML = `
+          <h3>รวมความจำเป็นภาค</h3>
+          <p>${parts.join('<br>') || 'มีภาคที่ถึงรอบต้องจัดการ'}</p>
+          <p>ภาคละ ${s.arcFlexible ? `${b.min}–${b.max} ก้อน (AI เลือกจุดตัดตามเนื้อเรื่อง)` : `${b.target} ก้อน`} · เรียก API ประมาณ ${Math.max(1, hi + due.stale)} ครั้ง แล้วเขียนเรื่องย่อใหม่จากภาค
+          ระหว่างนี้คุยต่อได้ตามปกติ ความจำทุกก้อนยังอยู่ครบ</p>
+          <small>ภาคช่วยให้บอทจำเรื่องช่วงเก่า ๆ ได้ทั้งช่วง และกันเรื่องย่อเพี้ยนเมื่อแชทยาวมาก ถ้ายังไม่รวม จะถามอีกเมื่อมีความจำเพิ่มอีก ${b.target} ก้อน หรือกด "รวมเป็นภาค" ในคลังความจำเมื่อไหร่ก็ได้</small>`;
+        const ok = await c.callGenericPopup(box, c.POPUP_TYPE.CONFIRM, '', { okButton: 'รวมเลย', cancelButton: 'ไว้ทีหลัง' });
+        if (ctx().chatId !== chatId) return;
+        if (ok) { delete st.arcSnooze; saveState(); arcAsking = false; await runArcs({}); return; }
+        st.arcSnooze = due.units + b.target;
+        saveState();
+    } finally {
+        arcAsking = false;
+    }
+}
+
 // ---------------------------------------------------------------- per-generation: trim + recall
 
 function clearPrompts() {
@@ -1167,11 +1577,16 @@ function place(key, value, where, depth) {
     else ctx().setExtensionPrompt(key, value, 0, 0, false, 0);
 }
 
+/** Recalled memories past this many get one more slot: more memories compete for the same few. */
+const MANY_MEMORIES = 60;
+const effectiveTopK = (s, n) => s.topK + (s.topK > 0 && n > MANY_MEMORIES ? 1 : 0);
+
 async function selectRecall(st, queryText) {
     const s = settings();
     const pool = st.memories.filter(m => String(m.text ?? '').trim());
     const why = new Map();
-    if (!pool.length) return { picked: [], tokens: 0, why };
+    const result = { picked: [], arcs: [], tokens: 0, why, pinnedTokens: 0, budget: wordBudget().recall };
+    if (!pool.length) return result;
 
     const latest = latestOf(pool);
     const chosen = new Map();
@@ -1182,9 +1597,10 @@ async function selectRecall(st, queryText) {
     // score each; the floor keeps small talk from pulling in random memories.
     const all = rankMemories(pool, queryText);
     const floor = Math.max(1, (all[0]?.score ?? 0) * 0.35);
+    const topK = effectiveTopK(s, pool.length);
     let extra = 0;
     for (const r of all) {
-        if (extra >= s.topK || r.score < floor) break;
+        if (extra >= topK || r.score < floor) break;
         if (chosen.has(r.memory.id)) continue;
         chosen.set(r.memory.id, r.memory);
         why.set(r.memory.id, r.hits.slice(0, 6));
@@ -1193,19 +1609,70 @@ async function selectRecall(st, queryText) {
 
     // budget: pinned first, then the latest, then by relevance;
     // pinned and the latest always go in, even over the budget
-    const budget = wordBudget().recall;
-    const picked = [];
+    const budget = result.budget;
     let tokens = 0;
     for (const m of chosen.values()) {
         const t = await countTokens(memoryBlock(m));
         const must = m.pinned || (s.includeLatest && m.id === latest?.id);
         if (!must && tokens + t > budget) continue;
-        picked.push(m);
+        result.picked.push(m);
         tokens += t;
+        if (m.pinned) result.pinnedTokens += t;
     }
     const order = new Map(st.memories.map((m, i) => [m.id, i]));
-    picked.sort((a, b) => order.get(a.id) - order.get(b.id));
-    return { picked, tokens, why };
+    result.picked.sort((a, b) => order.get(a.id) - order.get(b.id));
+
+    // arcs: pinned ones, then the best matches, in their own budget
+    if (arcsOn() && st.arcs.length) {
+        const plan = arcPlan();
+        const live = st.arcs.filter(a => String(a.text ?? '').trim());
+        const pickA = new Map();
+        for (const a of live) if (a.pinned) { pickA.set(a.id, a); why.set(a.id, ['📌']); }
+        if (s.arcRecall > 0) {
+            const ranked = rankMemories(live, queryText);
+            const aFloor = Math.max(1, (ranked[0]?.score ?? 0) * 0.35);
+            let n = 0;
+            for (const r of ranked) {
+                if (n >= s.arcRecall || r.score < aFloor) break;
+                if (pickA.has(r.memory.id)) continue;
+                pickA.set(r.memory.id, r.memory);
+                why.set(r.memory.id, r.hits.slice(0, 6));
+                n++;
+            }
+        }
+        let arcTokens = 0;
+        for (const a of pickA.values()) {
+            const t = await countTokens(memoryBlock(a));
+            if (!a.pinned && arcTokens + t > plan.recall) continue;
+            result.arcs.push(a);
+            arcTokens += t;
+            if (a.pinned) result.pinnedTokens += t;
+        }
+        const aOrder = new Map(st.arcs.map((a, i) => [a.id, i]));
+        result.arcs.sort((x, y) => aOrder.get(x.id) - aOrder.get(y.id));
+        result.budget += plan.recall;
+        tokens += arcTokens;
+    }
+    result.tokens = tokens;
+    return result;
+}
+
+/**
+ * The recalled arcs and memories as prompt lines, each with where it sits in
+ * the story ("[Memory 8/58 · #140–#159 · ~900 messages ago]"), so the model can
+ * tell an old fact from the current one. Arcs (the big picture) come first.
+ */
+function recallLines(st, picked, arcs) {
+    const len = ctx().chat.length;
+    const units = arcUnits(st);
+    const at = new Map(units.map((m, i) => [m.id, i]));
+    const line = (m, tag) => `• ${tag ? `${tag} ` : ''}${m.title ? m.title + ': ' : ''}${String(m.text ?? '').trim()}`;
+    return [
+        ...arcs.map(a => line(a, ageTag({ kind: 'arc', index: st.arcs.indexOf(a) + 1, total: st.arcs.length, start: a.start, end: a.end, chatLength: len, earlier: a.end < 0 }))),
+        ...picked.map(m => line(m, at.has(m.id)
+            ? ageTag({ kind: 'memory', index: at.get(m.id) + 1, total: units.length, start: m.start, end: m.end, chatLength: len, earlier: m.source === 'carry' })
+            : '')),
+    ].join('\n');
 }
 
 let savedCache = { chatId: null, key: '', tokens: 0 };
@@ -1242,8 +1709,8 @@ async function intercept(chat, _contextSize, _abort, type) {
     if (!s.enabled) { lastInjection = null; return; }
 
     // A chunk may be summarizing right now: let it land first, so this prompt
-    // already benefits from it.
-    if (busy) await Promise.race([busy, wait(s.timeoutSec * 1000 * Math.max(1, activeSources().length))]);
+    // already benefits from it. Arcs are not worth the wait.
+    if (busy && job?.kind !== 'arc') await Promise.race([busy, wait(s.timeoutSec * 1000 * Math.max(1, activeSources().length))]);
 
     const st = state();
     if (!st) return;
@@ -1280,10 +1747,10 @@ async function intercept(chat, _contextSize, _abort, type) {
     // 3. recall
     const recent = full.filter(m => !m.is_system).slice(-Math.max(1, s.queryDepth));
     const query = recent.map(m => cleanText(m.mes, 4000)).join('\n');
-    const { picked, tokens, why } = await selectRecall(st, query);
+    const { picked, arcs, why, pinnedTokens, budget } = await selectRecall(st, query);
     let recallText = '';
-    if (picked.length) {
-        recallText = String(s.recallTemplate || '{{memories}}').replaceAll('{{memories}}', picked.map(memoryBlock).join('\n'));
+    if (picked.length || arcs.length) {
+        recallText = String(s.recallTemplate || '{{memories}}').replaceAll('{{memories}}', recallLines(st, picked, arcs));
         place(KEY_RECALL, recallText, s.recallPosition, s.recallDepth);
     }
 
@@ -1295,8 +1762,13 @@ async function intercept(chat, _contextSize, _abort, type) {
         overviewText,
         overviewTokens: await countTokens(overviewText),
         recallText,
-        recallTokens: tokens,
-        picked: picked.map(m => ({ id: m.id, title: m.title, why: why.get(m.id) ?? [] })),
+        recallTokens: await countTokens(recallText),
+        recallBudget: budget,
+        pinnedTokens,
+        picked: [
+            ...arcs.map(a => ({ id: a.id, title: a.title, why: why.get(a.id) ?? [], arc: true })),
+            ...picked.map(m => ({ id: m.id, title: m.title, why: why.get(m.id) ?? [] })),
+        ],
     };
     refreshUi();
 }
@@ -1314,7 +1786,7 @@ async function continueInNewChat() {
     box.className = 'mh_carry';
     box.innerHTML = `
       <h3>เริ่มแชทใหม่ต่อเรื่องเดิม</h3>
-      <p>สร้างแชทใหม่กับตัวละครนี้ โดยพกความจำทั้งหมด (${st.memories.length} ก้อน) และเรื่องย่อไปด้วย
+      <p>สร้างแชทใหม่กับตัวละครนี้ โดยพกความจำทั้งหมด (${st.memories.length} ก้อน${st.arcs.length ? ` ${st.arcs.length} ภาค` : ''}) และเรื่องย่อไปด้วย
       แล้วใช้ <b>ข้อความล่าสุดของบอท</b> ในแชทนี้เป็นข้อความแรกของแชทใหม่</p>
       <label class="checkbox_label"><input type="checkbox" class="mh_carry_rest"> สรุปข้อความที่ยังไม่ได้สรุปให้หมดก่อน (แนะนำ ไม่งั้นข้อความ ${Math.max(0, c.chat.length - 1 - st.lastEnd)} ข้อความล่าสุดจะไม่ถูกจำ)</label>
       <small>แชทเดิมไม่ถูกแก้ไข เปิดกลับไปได้ตามปกติ</small>`;
@@ -1359,6 +1831,13 @@ async function continueInNewChat() {
                 end: -1,
             };
         }),
+        arcs: (old.arcs ?? []).map(a => ({
+            ...a,
+            source: 'carry',
+            origin: a.origin ?? (a.end >= 0 ? { chat: oldId, start: a.start, end: a.end } : undefined),
+            start: -1,
+            end: -1,
+        })),
     };
 
     if (lastBot) {
@@ -1381,7 +1860,7 @@ async function continueInNewChat() {
     }
     await n.saveChat();
     await n.reloadCurrentChat();
-    toast.ok(`เริ่มแชทใหม่แล้ว พกความจำมา ${old.memories.length} ก้อน`);
+    toast.ok(`เริ่มแชทใหม่แล้ว พกความจำมา ${old.memories.length} ก้อน${old.arcs?.length ? ` ${old.arcs.length} ภาค` : ''}`);
 }
 
 // ---------------------------------------------------------------- import + optimize
@@ -1435,18 +1914,31 @@ function mergeForeign(other, id) {
     const st = state();
     const seen = new Set(st.memories.map(m => m.text));
     let n = 0;
+    const newId = new Map();
     const incoming = (other.memories ?? []).filter(m => m?.text && !seen.has(m.text)).map(m => {
         const { overviewAfter: _drop, stats: _stats, sourceMessages: _src, ...rest } = m;
         n++;
-        return { ...rest, id: uid(), source: m.source === 'auto' ? 'carry' : m.source, origin: m.origin ?? (m.end >= 0 ? { chat: id, start: m.start, end: m.end } : undefined), start: -1, end: -1 };
+        const nid = uid() + n;
+        if (m.id) newId.set(m.id, nid);
+        return { ...rest, id: nid, source: m.source === 'auto' ? 'carry' : m.source, origin: m.origin ?? (m.end >= 0 ? { chat: id, start: m.start, end: m.end } : undefined), start: -1, end: -1 };
     });
     // carried memories come before this chat's own ones
     const firstOwn = st.memories.findIndex(m => m.source === 'auto');
     st.memories.splice(firstOwn < 0 ? st.memories.length : firstOwn, 0, ...incoming);
+    // their arcs come along, pointing at the new ids
+    const arcsIn = (Array.isArray(other.arcs) ? other.arcs : []).map(a => {
+        const { overviewAfter: _o, stats: _s, ...rest } = a;
+        return {
+            ...rest, id: uid() + 'a', source: 'carry',
+            members: (a.members ?? []).map(x => newId.get(x)).filter(Boolean),
+            origin: a.origin ?? (a.end >= 0 ? { chat: id, start: a.start, end: a.end } : undefined), start: -1, end: -1,
+        };
+    }).filter(a => a.members.length && String(a.text ?? '').trim());
+    if (arcsIn.length) { st.arcs = [...arcsIn, ...st.arcs]; syncArcs(st); }
     if (!st.overview.trim() && other.overview) { st.overview = other.overview; st.baseOverview = other.overview; }
     st.chain = [...new Set([...(other.chain ?? []), id, ...(st.chain ?? [])])];
     saveState();
-    toast.ok(`นำเข้า ${n} ก้อนจาก ${id}`);
+    toast.ok(`นำเข้า ${n} ก้อน${arcsIn.length ? ` ${arcsIn.length} ภาค` : ''}จาก ${id}`);
     refreshUi();
 }
 
@@ -1544,10 +2036,13 @@ async function rebuildOverview() {
     const s = settings();
     const st = state();
     if (!st?.memories.length) return toast.info('ยังไม่มีความจำ');
+    // with arcs, the arcs stand in for the memories they hold: far fewer tokens, the same story
+    const held = new Set(arcsOn() ? st.arcs.flatMap(a => a.members) : []);
+    const items = [...(arcsOn() ? st.arcs.filter(a => String(a.text ?? '').trim()) : []), ...st.memories.filter(m => !held.has(m.id))];
     const batches = [];
     let cur = [];
     let size = 0;
-    for (const m of st.memories) {
+    for (const m of items) {
         const t = await countTokens(memoryBlock(m));
         if (cur.length && size + t > 6000) { batches.push(cur); cur = []; size = 0; }
         cur.push(m); size += t;
@@ -1626,6 +2121,8 @@ async function buildExport({ withSource = false } = {}) {
         const { overviewAfter: _o, ...rest } = m;
         memories.push({ ...rest, stats: { memTokens, srcTokens, ratio: srcTokens ? +(memTokens / srcTokens).toFixed(3) : null }, ...(sourceMessages ? { sourceMessages } : {}) });
     }
+    const arcs = [];
+    for (const a of st.arcs) arcs.push({ ...a, stats: { tokens: await countTokens(memoryBlock(a)), memories: a.members.length } });
     return {
         format: 'memory-hub-export',
         version: VERSION,
@@ -1644,20 +2141,24 @@ async function buildExport({ withSource = false } = {}) {
             responseLength: w.response,
             chunkSize: s.chunkSize,
             keepRaw: s.keepRaw,
+            arcSize: s.arcSize,
+            arcFlexible: s.arcFlexible,
             mode: s.mode,
             quotaBoost: s.quotaBoost,
             gentle: s.gentle,
             text: fill(summaryTemplate(), s.overviewEnabled) + (s.gentle === 'always' ? `\n\n${GENTLE_RULE}` : ''),
         },
-        recall: { topK: s.topK, budget: wordBudget().recall, queryDepth: s.queryDepth, lastInjection },
+        recall: { topK: s.topK, budget: wordBudget().recall, arcRecall: s.arcRecall, arcBudget: arcsOn() ? arcPlan().recall : 0, queryDepth: s.queryDepth, lastInjection },
         stats: {
             memories: st.memories.length,
+            arcs: st.arcs.length,
             summarizedSourceTokens: srcTotal,
             summarizedMemoryTokens: memTotal,
             compression: srcTotal ? +(memTotal / srcTotal).toFixed(3) : null,
             overviewTokens: await countTokens(st.overview),
         },
         overview: st.overview,
+        arcs,
         memories,
     };
 }
@@ -1669,7 +2170,7 @@ function exportMarkdown(x) {
         '',
         `- แชท: ${x.chat}`,
         `- ส่งออกเมื่อ: ${new Date(x.exportedAt).toLocaleString()} · Memory Hub v${x.version}`,
-        `- ข้อความทั้งหมด ${x.messages} · สรุปแล้วถึง #${x.summarizedUpTo} · ความจำ ${x.stats.memories} ก้อน`,
+        `- ข้อความทั้งหมด ${x.messages} · สรุปแล้วถึง #${x.summarizedUpTo} · ความจำ ${x.stats.memories} ก้อน${x.stats.arcs ? ` · ${x.stats.arcs} ภาค` : ''}`,
         `- prompt: ${x.prompt.style === 'custom' ? 'เขียนเองทั้งหมด' : `โมดูล ${x.prompt.modules.map(m => m.name).join(', ') || '(พื้นฐาน)'} (${{ bot: 'เลือกเอง', tags: 'จากแท็ก', default: 'ค่าเริ่มต้น' }[x.prompt.modulesFrom] ?? x.prompt.modulesFrom})`} · ความจำ ≤ ${x.prompt.memoryWords} คำ · เรื่องย่อ ≤ ${x.prompt.overviewWords} คำ · สรุปทีละ ${x.prompt.chunkSize} ข้อความ`,
         `- ย่อข้อความ ${x.stats.summarizedSourceTokens} โทเคน เหลือ ${x.stats.summarizedMemoryTokens} โทเคน (${pct(x.stats.compression)}) · เรื่องย่อ ${x.stats.overviewTokens} โทเคน`,
         '',
@@ -1677,9 +2178,19 @@ function exportMarkdown(x) {
         '',
         x.overview || '_(ยังไม่มี)_',
         '',
-        `## ความจำ (${x.memories.length})`,
-        '',
     ];
+    if (x.arcs?.length) {
+        const title = new Map(x.memories.map((m, i) => [m.id, i + 1]));
+        lines.push(`## ภาค (${x.arcs.length})`, '');
+        x.arcs.forEach((a, i) => {
+            const where = a.end >= 0 ? `#${a.start}–#${a.end}` : 'จากแชทก่อน';
+            const nums = a.members.map(id => title.get(id)).filter(Boolean);
+            lines.push(`### ภาค ${i + 1}. ${a.title || '(ไม่มีชื่อ)'}${a.pinned ? ' 📌' : ''}${a.stale ? ' ⏳ รอสร้างใหม่' : ''}`, '',
+                `_${where} · ${a.members.length} ก้อน${nums.length ? ` (ความจำข้อ ${nums[0]}–${nums.at(-1)})` : ''} · ${a.stats.tokens} โทเคน · จุดตัด: ${{ ai: 'AI เลือก', fixed: 'คงที่', auto: 'ค่ามาตรฐาน' }[a.cutBy] ?? '—'}_  `,
+                `คีย์: ${(a.keys ?? []).join(', ') || '—'}`, '', String(a.text ?? '').trim(), '');
+        });
+    }
+    lines.push(`## ความจำ (${x.memories.length})`, '');
     x.memories.forEach((m, i) => {
         const where = m.end >= 0 ? `#${m.start}–#${m.end}` : m.source === 'carry' ? 'จากแชทก่อน' : m.source === 'import' ? 'นำเข้า' : 'เพิ่มเอง';
         const st = m.stats.srcTokens ? ` · ต้นฉบับ ${m.stats.srcTokens} → ${m.stats.memTokens} โทเคน (${pct(m.stats.ratio)})` : ` · ${m.stats.memTokens} โทเคน`;
@@ -1783,7 +2294,8 @@ async function saveBackup({ all }) {
         const name = all ? `memory-hub backup - ${fileSafe(backup.bot)} - ${day}.json` : `memory-hub backup - ${fileSafe(backup.chats[0].chat)}.json`;
         download(name, JSON.stringify(backup, null, 2), 'application/json');
         const n = backup.chats.reduce((a, x) => a + (x.state?.memories?.length ?? 0), 0);
-        toast.ok(`สำรองแล้ว ${backup.chats.length} แชท ความจำรวม ${n} ก้อน`);
+        const k = backup.chats.reduce((a, x) => a + (x.state?.arcs?.length ?? 0), 0);
+        toast.ok(`สำรองแล้ว ${backup.chats.length} แชท ความจำรวม ${n} ก้อน${k ? ` ${k} ภาค` : ''}`);
         if (failed.length) toast.warn(`อ่านแชทเหล่านี้ไม่ได้ จึงไม่อยู่ในไฟล์: ${failed.join(', ')}`, { timeOut: 10000 });
     } catch (e) { toast.err(`สำรองไม่สำเร็จ: ${errText(e)}`); }
 }
@@ -1804,6 +2316,7 @@ function restoreState(entry) {
     const c = ctx();
     const next = copyOf(entry.state);
     next.memories = Array.isArray(next.memories) ? next.memories.filter(m => m && typeof m.text === 'string') : [];
+    next.arcs = Array.isArray(next.arcs) ? next.arcs.filter(a => a && Array.isArray(a.members)) : [];
     next.overview = String(next.overview ?? '');
     for (const m of next.memories) m.id ??= uid();
     c.chatMetadata[MODULE] = next;
@@ -1989,8 +2502,19 @@ function renderSettings() {
           ${numberRow('mh_ovwords', 'ความยาวเรื่องย่อ (คำ)', 'ความยาวสูงสุดของเรื่องย่อจนถึงตอนนี้', 50, 1500)}
           ${numberRow('mh_resp', 'Response length ตอนสรุป (โทเคน)', 'เพดานคำตอบของโมเดลตอนสรุป', 200, 8000)}
 
+          <h4>ภาค (สำหรับแชทยาว)</h4>
+          <small class="mh_hint">ทุก ๆ ราว 10 ก้อน ความจำจะถูกรวมเป็น 1 ภาค (ช่วงใหญ่ของเรื่อง) บอทดึงภาคมาได้เมื่อเรื่องวนกลับไปช่วงนั้น และเรื่องย่อถูกเขียนใหม่จากภาคทุกครั้ง จึงไม่เพี้ยนเมื่อแชทยาวมาก ความจำทุกก้อนยังอยู่ครบ</small>
+          ${numberRow('mh_arcsize', 'รวมเป็นภาคทุก (ก้อน)', 'จำนวนความจำมาตรฐานต่อหนึ่งภาค 0 = ไม่ใช้ภาค (เรื่องย่อถูกเขียนทับต่อกันไปแบบเดิม)', 0, 50)}
+          <div id="mh_arcbox">
+            <label class="checkbox_label" title="AI อ่านความจำแล้วเลือกจุดจบภาคตรงที่เรื่องเปลี่ยนช่วง เช่น ข้ามเวลา ย้ายที่ ปมหลักคลี่คลาย ภาคสั้นหรือยาวได้ตามเนื้อเรื่อง ปิด = ตัดทุก N ก้อนพอดี"><input type="checkbox" id="mh_arcflex"> ให้ AI เลือกจุดตัดภาคเอง <small id="mh_arcflex_range" class="mh_hint_inline"></small></label>
+            ${numberRow('mh_arcwords', 'ความยาวภาค (คำ ต่อ 10 ก้อน)', 'ภาคที่มีความจำมากกว่านี้ยาวขึ้นตามสัดส่วน และยาวขึ้นตามความยาวความจำ (โมดูล ตัวคูณโควต้า)', 50, 1500)}
+            ${numberRow('mh_arcrecall', 'ดึงภาคที่เกี่ยวข้องสูงสุด (ภาค)', 'ต่อเทิร์น นอกเหนือจากความจำ ภาคที่ปักหมุดใส่เสมอ 0 = ไม่ดึงภาค (ยังใช้ภาคเขียนเรื่องย่อ)', 0, 5)}
+            ${numberRow('mh_arcbudget', 'งบโทเคนต่อภาคที่ดึง', 'สำหรับภาคมาตรฐาน 10 ก้อน ภาคที่ใหญ่กว่าหรือยาวกว่าได้งบเพิ่มตามสัดส่วนเอง', 100, 8000)}
+          </div>
+          <small id="mh_arc_now" class="mh_hint"></small>
+
           <h4>การดึงความจำ</h4>
-          ${numberRow('mh_topk', 'ดึงความจำที่เกี่ยวข้องสูงสุด (ก้อน)', 'ไม่นับก้อนล่าสุดและก้อนที่ปักหมุด', 0, 20)}
+          ${numberRow('mh_topk', 'ดึงความจำที่เกี่ยวข้องสูงสุด (ก้อน)', 'ไม่นับก้อนล่าสุดและก้อนที่ปักหมุด เมื่อมีความจำเกิน 60 ก้อน จะดึงเพิ่มให้อีก 1 ก้อนเอง', 0, 20)}
           ${numberRow('mh_budget', 'งบโทเคนของความจำที่ดึง', 'รวมทุกก้อนที่ดึงมา (ไม่นับเรื่องย่อ) ขยายตามโมดูลถ้าเปิดไว้ ก้อนที่ปักหมุดและก้อนล่าสุดใส่เสมอแม้เกินงบ', 100, 8000)}
           ${numberRow('mh_qdepth', 'ดูบริบทจากข้อความล่าสุด (ข้อความ)', 'ใช้ข้อความล่าสุดกี่ข้อความเป็นตัวตัดสินว่าอะไรเกี่ยวข้อง', 1, 20)}
 
@@ -2069,6 +2593,16 @@ function renderSettings() {
     bindNum('#mh_ovwords', 'overviewWords', 50, 1500);
     bindNum('#mh_resp', 'responseLength', 200, 8000);
     bindNum('#mh_topk', 'topK', 0, 20);
+    $('#mh_arcsize').val(s.arcSize).on('change', function () {
+        let v = clampInt(this.value, 0, 50, DEFAULTS.arcSize);
+        if (v === 1) v = 2;
+        s.arcSize = v; this.value = v; saveSettings(); refreshUi();
+        if (v) maybeArcs();
+    });
+    bindCheck('#mh_arcflex', 'arcFlexible');
+    bindNum('#mh_arcwords', 'arcWords', 50, 1500);
+    bindNum('#mh_arcrecall', 'arcRecall', 0, 5);
+    bindNum('#mh_arcbudget', 'arcBudget', 100, 8000);
     bindNum('#mh_budget', 'recallBudget', 100, 8000);
     bindNum('#mh_qdepth', 'queryDepth', 1, 20);
     bindNum('#mh_timeout', 'timeoutSec', 15, 600);
@@ -2307,18 +2841,28 @@ function refreshUi() {
     $('#mh_bcolor, #mh_bsize').closest('.mh_row').toggle(s.badgeStyle !== 'none');
     $('#mh_bcustom').toggle(s.badgeStyle !== 'none' && s.badgeColor === 'custom');
     renderModulePicker();
+    $('#mh_arcbox').toggle(arcsOn());
+    if (arcsOn()) {
+        const ap = arcPlan();
+        $('#mh_arcflex_range').text(`(${ap.min}–${ap.max} ก้อน)`);
+        const fmt = n => n.toLocaleString();
+        $('#mh_arc_now').text(`ภาค: ${s.arcFlexible ? `${ap.min}–${ap.max}` : ap.target} ก้อน · ยาว ~${fmt(ap.wordsFor(ap.target))} คำที่ ${ap.target} ก้อน${s.arcFlexible ? ` (ถึง ~${fmt(ap.wordsFor(ap.max))} คำที่ ${ap.max} ก้อน)` : ''} · งบดึงภาค ~${fmt(ap.recall)} โทเคน`);
+    } else {
+        $('#mh_arc_now').text('ปิดระบบภาคอยู่: ความจำไม่ถูกรวมเป็นภาค และเรื่องย่อถูกเขียนทับต่อกันไปแบบเดิม');
+    }
 
     let status;
     if (!st) status = 'ยังไม่ได้เปิดแชท';
     else {
         const len = ctx().chat.length;
         const pending = Math.max(0, len - 1 - st.lastEnd);
-        status = `ความจำ <b>${st.memories.length}</b> ก้อน · สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> · ยังไม่สรุป <b>${pending}</b> ข้อความ`;
+        status = `ความจำ <b>${st.memories.length}</b> ก้อน${st.arcs.length ? ` · <b>${st.arcs.length}</b> ภาค` : ''} · สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> · ยังไม่สรุป <b>${pending}</b> ข้อความ`;
         if (st.chain?.length) status += ` · ต่อมาจาก ${st.chain.length} แชทก่อนหน้า`;
         if (off) status += ` · <b>${OFF_TH[off]}</b>`;
         if (busy) status += ' · <i class="fa-solid fa-spinner fa-spin"></i> กำลังทำงาน';
         if (lastInjection) {
-            status += `<br>ครั้งล่าสุด: ส่งเรื่องย่อ ${lastInjection.overviewTokens} + ความจำ ${lastInjection.picked.length} ก้อน ${lastInjection.recallTokens} โทเคน`;
+            const nArc = lastInjection.picked.filter(p => p.arc).length;
+            status += `<br>ครั้งล่าสุด: ส่งเรื่องย่อ ${lastInjection.overviewTokens} + ${nArc ? `ภาค ${nArc} + ` : ''}ความจำ ${lastInjection.picked.length - nArc} ก้อน ${lastInjection.recallTokens} โทเคน`;
             if (lastInjection.trimmed) status += ` · ไม่ส่งข้อความเก่า ${lastInjection.trimmed} ข้อความ (ประหยัด ~${lastInjection.trimmedTokens} โทเคน)`;
         }
         if (lastApi) {
@@ -2338,6 +2882,8 @@ function refreshUi() {
     if (missing.length) warns.push(`มี Connection Profile ในรายการ API ที่หาไม่เจอ ${missing.length} อัน (จะถูกข้าม)`);
     const gaps = st ? gapsOf(st) : [];
     if (gaps.length) warns.push(gapWarning(gaps));
+    if (lastInjection && lastInjection.pinnedTokens > 2 * (lastInjection.recallBudget || Infinity)) warns.push(`ความจำและภาคที่ปักหมุดรวม ~${lastInjection.pinnedTokens} โทเคน เกินงบความจำที่ดึง (${lastInjection.recallBudget}) กว่า 2 เท่า ทุกก้อนที่ปักหมุดถูกส่งทุกเทิร์นแม้เกินงบ ลองเอาหมุดออกจากก้อนที่ไม่จำเป็นแล้ว (ในคลังความจำ)`);
+    if (st && arcsOn() && s.mode === 'manual' && st.arcs.some(a => a.stale)) warns.push(`มี ${st.arcs.filter(a => a.stale).length} ภาคที่ต้องสร้างใหม่ (ความจำข้างในถูกลบหรือสรุปใหม่) กด "รวมเป็นภาค" ในคลังความจำ`);
     if (st && hasBacklog(s, st, c.chat.length)) warns.push(`ยังไม่สรุป ${pendingOf(st, c.chat.length)} ข้อความ (โหมด${MODE_TH[s.mode]}) ข้อความเหล่านี้ถูกส่งเต็มทุกเทิร์น กด "สรุปตอนนี้" เพื่อประหยัดโทเคนและไม่ให้ข้อความเก่าหลุดจาก context`);
     $('#mh_warn').html(warns.map(w => `<div><i class="fa-solid fa-triangle-exclamation"></i> ${esc(w)}</div>`).join(''));
 
@@ -2403,6 +2949,7 @@ async function summarizeChosenRange(from, to) {
             if (st) saveState();
             lastJob = { ok: true, text: `สรุป #${from}–#${to} เป็นความจำ 1 ก้อน`, at: Date.now() };
             toast.ok(mem ? `สร้างความจำ #${from}–#${to} แล้ว` : `ช่วง #${from}–#${to} ไม่มีข้อความให้สรุป`);
+            if (mem) setTimeout(maybeArcs, 0);
         } catch (e) {
             console.error(LOG, e);
             lastJob = { ok: false, text: `สรุป #${from}–#${to} ไม่สำเร็จ: ${failText(e, `#${from}–#${to}`)}`, at: Date.now() };
@@ -2465,12 +3012,12 @@ async function showLastInjection() {
     const li = lastInjection;
     const { Popup, POPUP_TYPE } = ctx();
     if (!li) return toast.info('ยังไม่มีการส่งข้อความตั้งแต่เปิดแชทนี้ ลองส่งหรือ swipe หนึ่งครั้ง');
-    const rows = li.picked.map(p => `<li><b>${esc(p.title)}</b> <small>${esc(p.why.join(' · '))}</small></li>`).join('');
+    const rows = li.picked.map(p => `<li>${p.arc ? '📚 ภาค: ' : ''}<b>${esc(p.title)}</b> <small>${esc(p.why.join(' · '))}</small></li>`).join('');
     const html = `<div class="mh_preview">
       <h3>สิ่งที่ Memory Hub ใส่ใน prompt ล่าสุด</h3>
       <p>ไม่ส่งข้อความที่สรุปแล้ว <b>${li.trimmed}</b> ข้อความ (~${li.trimmedTokens} โทเคน) ·
          เรื่องย่อ <b>${li.overviewTokens}</b> โทเคน · ความจำที่ดึง <b>${li.recallTokens}</b> โทเคน</p>
-      ${rows ? `<h4>ความจำที่ถูกเลือก (เหตุผล)</h4><ul>${rows}</ul>` : ''}
+      ${rows ? `<h4>ความจำและภาคที่ถูกเลือก (เหตุผล)</h4><ul>${rows}</ul>` : ''}
       ${li.overviewText ? `<h4>เรื่องย่อ</h4><pre>${esc(li.overviewText)}</pre>` : ''}
       ${li.recallText ? `<h4>ความจำ</h4><pre>${esc(li.recallText)}</pre>` : ''}
     </div>`;
@@ -2490,7 +3037,10 @@ function renderManagerHeader() {
     const imported = st.memories.filter(m => m.source === 'import').length;
     const carried = st.memories.filter(m => m.source === 'carry').length;
     const gaps = gapsOf(st);
-    el.innerHTML = `ความจำ <b>${st.memories.length}</b> ก้อน${carried ? ` (จากแชทก่อน ${carried})` : ''}${imported ? ` (นำเข้า ${imported})` : ''} · สรุปแล้วถึง #${st.lastEnd} จาก ${len} ข้อความ${busy ? ' · <i class="fa-solid fa-spinner fa-spin"></i> กำลังทำงาน <a href="#" class="mh_cancel">หยุด</a>' : ''}`
+    const held = new Set(st.arcs.flatMap(a => a.members));
+    const loose = arcUnits(st).filter(m => !held.has(m.id)).length;
+    const arcLine = st.arcs.length ? ` · <b>${st.arcs.length}</b> ภาค (ยังไม่เข้าภาค ${loose} ก้อน)` : '';
+    el.innerHTML = `ความจำ <b>${st.memories.length}</b> ก้อน${carried ? ` (จากแชทก่อน ${carried})` : ''}${imported ? ` (นำเข้า ${imported})` : ''}${arcLine} · สรุปแล้วถึง #${st.lastEnd} จาก ${len} ข้อความ${busy ? ' · <i class="fa-solid fa-spinner fa-spin"></i> กำลังทำงาน <a href="#" class="mh_cancel">หยุด</a>' : ''}`
         + (gaps.length ? `<div class="mh_bad">⚠ ${esc(gapWarning(gaps))} <a href="#" class="mh_gap_fill">สรุปช่วงนี้</a> · <a href="#" class="mh_gap_skip">ไม่ต้องจำ</a></div>` : '');
     el.querySelector('.mh_gap_fill')?.addEventListener('click', async e => { e.preventDefault(); await chooseRangeDialog(); renderManagerList(); renderManagerHeader(); });
     el.querySelector('.mh_gap_skip')?.addEventListener('click', async e => { e.preventDefault(); await skipGaps(); renderManagerHeader(); });
@@ -2526,17 +3076,92 @@ function fitKeys(el) {
 }
 const fitAllKeys = () => requestAnimationFrame(() => managerEl?.querySelectorAll('.mh_keys').forEach(fitKeys));
 
+/** Loose memories shown before "show more" (a phone slows down with hundreds of text boxes). */
+const PAGE = 40;
+let managerShown = PAGE;
+const expandedArcs = new Set();
+
+function arcCard(st, a, recalled, byId) {
+    const i = st.arcs.indexOf(a);
+    const last = i === st.arcs.length - 1;
+    const where = a.end >= 0 ? `#${a.start}–#${a.end}${a.carried ? ' + จากแชทก่อน' : ''}`
+        : `จากแชทก่อน${a.origin ? ` #${a.origin.start}–#${a.origin.end}` : ''}`;
+    const open = expandedArcs.has(a.id);
+    const members = open ? a.members.map(id => byId.get(id)).filter(Boolean) : [];
+    const cut = { ai: 'AI เลือกจุดตัด', fixed: 'ตัดตามจำนวน', auto: 'ใช้จำนวนมาตรฐาน' }[a.cutBy];
+    return `<div class="mh_card mh_arc${a.pinned ? ' mh_pinned' : ''}${recalled.has(a.id) ? ' mh_recalled' : ''}" data-arc="${esc(a.id)}">
+      <div class="mh_card_head">
+        <span class="mh_arc_no">ภาค ${i + 1}</span>
+        <input class="text_pole mh_title" value="${esc(a.title)}" placeholder="ชื่อภาค">
+        <i class="fa-solid fa-thumbtack mh_icon mh_pin" title="ปักหมุด: ใส่ใน prompt ทุกครั้ง"></i>
+        <i class="fa-solid fa-rotate mh_icon mh_arc_re" title="สร้างภาคนี้ใหม่จากความจำข้างใน"></i>
+        ${a.members.length > 1 ? '<i class="fa-solid fa-scissors mh_icon mh_arc_split" title="แยกเป็นสองภาค"></i>' : ''}
+        ${last ? '<i class="fa-solid fa-trash mh_icon mh_arc_del" title="ยุบภาคนี้ (ความจำข้างในยังอยู่ครบ)"></i>' : '<i class="fa-solid fa-object-group mh_icon mh_arc_merge" title="รวมกับภาคถัดไป"></i>'}
+      </div>
+      <div class="mh_arc_meta">${a.members.length} ก้อน · ${esc(where)}${cut ? ` · ${cut}` : ''}
+        ${a.stale ? ' <span class="mh_trunc" title="ความจำข้างในถูกลบ เพิ่ม หรือสรุปใหม่ ภาคนี้จะถูกเขียนใหม่รอบถัดไป หรือกด 🔄">⏳ รอสร้างใหม่</span>' : ''}
+        ${a.edited ? ' <span class="mh_trunc mh_soft mh_edited" title="มีความจำข้างในที่ถูกแก้เอง ภาคยังเป็นข้อความเดิม กด 🔄 เพื่อเขียนภาคใหม่ หรือแก้ข้อความภาคเอง">✎ ความจำข้างในถูกแก้</span>' : ''}
+        ${a.gentle ? ' <span class="mh_trunc mh_soft">🕊 แบบเบา</span>' : ''}
+        ${a.truncated ? ' <span class="mh_trunc" title="คำตอบของโมเดลถูกตัดกลางคัน ภาคนี้อาจไม่ครบ — เพิ่ม Response length แล้วกด 🔄">⚠ ไม่ครบ</span>' : ''}</div>
+      <textarea class="text_pole mh_keys" rows="1" placeholder="คีย์ (คั่นด้วย , หรือขึ้นบรรทัดใหม่)">${esc((a.keys ?? []).join(', '))}</textarea>
+      <textarea class="text_pole mh_text" rows="5">${esc(a.text)}</textarea>
+      ${recalled.has(a.id) ? '<small class="mh_tag">ถูกใส่ใน prompt ล่าสุด</small>' : ''}
+      <div class="mh_arc_toggle" tabindex="0" role="button"><i class="fa-solid fa-caret-${open ? 'down' : 'right'}"></i> ${open ? 'ซ่อน' : 'ดู'}ความจำในภาคนี้ (${a.members.length})</div>
+      ${open ? `<div class="mh_arc_members">${members.map(m => memoryCard(m, recalled.has(m.id))).join('')}</div>` : ''}
+    </div>`;
+}
+
 function renderManagerList() {
     const st = state();
     const list = managerEl?.querySelector('.mh_list');
     if (!list || !st) return;
+    if (syncArcs(st)) saveState();
     const f = managerFilter.trim().toLowerCase();
     const recalled = new Set(lastInjection?.picked.map(p => p.id) ?? []);
-    const mems = [...st.memories].reverse().filter(m => !f || `${m.title} ${(m.keys ?? []).join(' ')} ${m.text}`.toLowerCase().includes(f));
-    list.innerHTML = mems.length ? mems.map(m => memoryCard(m, recalled.has(m.id))).join('') : '<div class="mh_empty">ยังไม่มีความจำ กด "สรุปตอนนี้" หรือคุยต่อไปจนครบรอบ</div>';
+    const byId = new Map(st.memories.map(m => [m.id, m]));
+    const match = m => `${m.title} ${(m.keys ?? []).join(' ')} ${m.text}`.toLowerCase().includes(f);
+    let html = '';
+    if (f) {
+        // search looks everywhere, arcs and the memories inside them
+        const arcs = [...st.arcs].reverse().filter(match);
+        const mems = [...st.memories].reverse().filter(match);
+        html = arcs.map(a => arcCard(st, a, recalled, byId)).join('') + mems.map(m => memoryCard(m, recalled.has(m.id))).join('');
+        if (!html) html = '<div class="mh_empty">ไม่พบ</div>';
+    } else {
+        const held = new Set(st.arcs.flatMap(a => a.members));
+        const loose = [...st.memories].reverse().filter(m => !held.has(m.id));
+        if (st.arcs.length && loose.length) html += `<div class="mh_sub_head">ยังไม่เข้าภาค (${loose.length})</div>`;
+        html += loose.slice(0, managerShown).map(m => memoryCard(m, recalled.has(m.id))).join('');
+        if (loose.length > managerShown) html += `<div class="menu_button mh_more">แสดงเพิ่มอีก ${Math.min(PAGE, loose.length - managerShown)} (เหลือ ${loose.length - managerShown})</div>`;
+        if (st.arcs.length) {
+            html += `<div class="mh_sub_head">ภาค (${st.arcs.length}) <small>ความจำที่รวมเป็นภาคแล้ว ใหม่สุดอยู่บน</small></div>`;
+            html += [...st.arcs].reverse().map(a => arcCard(st, a, recalled, byId)).join('');
+        }
+        if (!html) html = '<div class="mh_empty">ยังไม่มีความจำ กด "สรุปตอนนี้" หรือคุยต่อไปจนครบรอบ</div>';
+    }
+    list.innerHTML = html;
     fitAllKeys();
     const hasImports = st.memories.some(m => m.source === 'import' && !m.optimized);
     managerEl.querySelector('.mh_do_optimize')?.classList.toggle('mh_hidden', !hasImports);
+    managerEl.querySelector('.mh_do_arcs')?.classList.toggle('mh_hidden', !arcsOn());
+}
+
+/** Asks after which memory an arc should be split. @returns {Promise<number|null>} how many stay in the first part */
+async function askSplit(st, a) {
+    const c = ctx();
+    const byId = new Map(st.memories.map(m => [m.id, m]));
+    const box = document.createElement('div');
+    box.className = 'mh_carry';
+    const opts = a.members.slice(0, -1).map((id, i) => {
+        const m = byId.get(id);
+        return `<option value="${i + 1}"${i + 1 === Math.ceil(a.members.length / 2) ? ' selected' : ''}>${i + 1}. ${esc(m?.title ?? '')} ${m?.end >= 0 ? `(#${m.start}–#${m.end})` : ''}</option>`;
+    }).join('');
+    box.innerHTML = `<h3>แยกภาค "${esc(a.title)}"</h3>
+      <p>ภาคแรกจบที่ความจำก้อนไหน? ที่เหลือจะเป็นภาคใหม่ แล้วเขียนทั้งสองภาคใหม่ (เรียก API 2 ครั้ง)</p>
+      <select class="text_pole mh_split_at">${opts}</select>`;
+    const ok = await c.callGenericPopup(box, c.POPUP_TYPE.CONFIRM, '', { okButton: 'แยกภาค', cancelButton: 'ยกเลิก' });
+    if (!ok) return null;
+    return Number(box.querySelector('.mh_split_at').value) || null;
 }
 
 async function openManager() {
@@ -2554,6 +3179,7 @@ async function openManager() {
         <div class="menu_button mh_do_add"><i class="fa-solid fa-plus"></i> เพิ่มความจำเอง</div>
         <div class="menu_button mh_do_import"><i class="fa-solid fa-file-import"></i> นำเข้า</div>
         <div class="menu_button mh_do_optimize"><i class="fa-solid fa-broom"></i> จัดระเบียบที่นำเข้า (AI)</div>
+        <div class="menu_button mh_do_arcs" title="รวมความจำที่ยังไม่เข้าภาคเป็นภาค (ต้องมีอย่างน้อยครึ่งภาค) และสร้างภาคที่ค้างใหม่"><i class="fa-solid fa-layer-group"></i> รวมเป็นภาค</div>
         <div class="menu_button mh_do_rebuild"><i class="fa-solid fa-book-open"></i> สร้างเรื่องย่อใหม่</div>
         <div class="menu_button mh_do_carry"><i class="fa-solid fa-forward"></i> เริ่มแชทใหม่ต่อเรื่อง</div>
         <div class="menu_button mh_do_export"><i class="fa-solid fa-file-export"></i> ส่งออก</div>
@@ -2564,6 +3190,7 @@ async function openManager() {
       <div class="mh_list_head"><b>ความจำ</b> <input class="text_pole mh_search" placeholder="ค้นหา…"></div>
       <div class="mh_list"></div>`;
     managerEl = root;
+    managerShown = PAGE;
     renderManagerHeader();
     renderManagerList();
     applyIcon(root);
@@ -2575,18 +3202,26 @@ async function openManager() {
 
     root.querySelector('.mh_search').addEventListener('input', e => { managerFilter = e.target.value; renderManagerList(); });
 
+    // a card is a memory (data-id) or an arc (data-arc); memory cards can sit inside an arc card
     const find = el => {
         const id = el.closest('.mh_card')?.dataset.id;
-        return state().memories.find(m => m.id === id);
+        return id ? state().memories.find(m => m.id === id) : undefined;
+    };
+    const findArc = el => {
+        const id = el.closest('.mh_card')?.dataset.arc;
+        return id ? state().arcs.find(a => a.id === id) : undefined;
     };
     root.addEventListener('input', e => {
         const t = e.target;
-        const m = t.closest?.('.mh_card') && find(t);
+        if (!t.closest?.('.mh_card')) return;
+        const m = find(t) ?? findArc(t);
         if (!m) return;
         if (t.classList.contains('mh_title')) m.title = t.value;
         else if (t.classList.contains('mh_keys')) { m.keys = t.value.split(/[,，\n]/).map(x => x.trim()).filter(Boolean); fitKeys(t); }
         else if (t.classList.contains('mh_text')) m.text = t.value;
         else return;
+        // an arc does not change when one of its memories is edited by hand: say so on the arc
+        if (!m.members) { const a = arcOf(state(), m.id); if (a && !a.edited) { a.edited = true; const meta = t.closest('.mh_arc')?.querySelector('.mh_arc_meta'); if (meta && !meta.querySelector('.mh_edited')) meta.insertAdjacentHTML('beforeend', ' <span class="mh_trunc mh_soft mh_edited">✎ ความจำข้างในถูกแก้</span>'); } }
         saveState();
     });
     let popup;
@@ -2603,13 +3238,71 @@ async function openManager() {
         if (t.closest('.mh_do_import')) { await importDialog(); syncOverview(); renderManagerList(); renderManagerHeader(); return; }
         if (t.closest('.mh_do_optimize')) { if (guardBusy()) return; await optimizeImported(); syncOverview(); renderManagerList(); return; }
         if (t.closest('.mh_do_rebuild')) { if (guardBusy()) return; await rebuildOverview(); syncOverview(); return; }
+        if (t.closest('.mh_do_arcs')) { if (guardBusy()) return; await runArcs({ force: true }); syncOverview(); renderManagerList(); renderManagerHeader(); return; }
+        if (t.closest('.mh_more')) { managerShown += PAGE; renderManagerList(); return; }
+        const toggle = t.closest('.mh_arc_toggle');
+        if (toggle) {
+            const id = toggle.closest('.mh_arc')?.dataset.arc;
+            if (expandedArcs.has(id)) expandedArcs.delete(id); else expandedArcs.add(id);
+            renderManagerList();
+            return;
+        }
+        const arc = findArc(t); // undefined for a memory card, also one inside an arc
+        if (arc) {
+            const cur = state();
+            const i = cur.arcs.indexOf(arc);
+            if (t.classList.contains('mh_pin')) { arc.pinned = !arc.pinned; saveState(); renderManagerList(); return; }
+            if (t.classList.contains('mh_arc_re')) {
+                if (guardBusy()) return;
+                arc.stale = true; saveState();
+                await runArcs({}); syncOverview(); renderManagerList(); renderManagerHeader(); return;
+            }
+            if (t.classList.contains('mh_arc_split')) {
+                if (guardBusy()) return;
+                const k = await askSplit(cur, arc);
+                if (!k || busy) return;
+                const now = state();
+                const a = now.arcs.find(x => x.id === arc.id);
+                if (!a || k >= a.members.length) return;
+                const second = { id: uid(), pinned: false, title: `${a.title} (ต่อ)`, keys: [...(a.keys ?? [])], text: a.text, members: a.members.slice(k), stale: true, ts: Date.now() };
+                a.members = a.members.slice(0, k); a.stale = true;
+                now.arcs.splice(now.arcs.indexOf(a) + 1, 0, second);
+                syncArcs(now); saveState();
+                await runArcs({}); syncOverview(); renderManagerList(); renderManagerHeader(); return;
+            }
+            if (t.classList.contains('mh_arc_merge')) {
+                const next = cur.arcs[i + 1];
+                if (!next || guardBusy()) return;
+                const ok = await ctx().callGenericPopup(`รวมภาค "${esc(arc.title)}" กับ "${esc(next.title)}" เป็นภาคเดียว (${arc.members.length + next.members.length} ก้อน) แล้วเขียนภาคใหม่ (เรียก API 1 ครั้ง)?`, ctx().POPUP_TYPE.CONFIRM);
+                if (!ok || busy) return;
+                const now = state();
+                const a = now.arcs.find(x => x.id === arc.id);
+                const b = now.arcs.find(x => x.id === next.id);
+                if (!a || !b) return;
+                a.members = [...a.members, ...b.members]; a.stale = true; a.pinned = a.pinned || b.pinned;
+                now.arcs = now.arcs.filter(x => x !== b);
+                syncArcs(now); saveState();
+                await runArcs({}); syncOverview(); renderManagerList(); renderManagerHeader(); return;
+            }
+            if (t.classList.contains('mh_arc_del')) {
+                if (guardBusy()) return;
+                const ok = await ctx().callGenericPopup(`<h3>ยุบภาค "${esc(arc.title)}"?</h3><p>ความจำ ${arc.members.length} ก้อนข้างในยังอยู่ครบ แค่กลับไปเป็นความจำที่ยังไม่เข้าภาค${settings().mode === 'auto' ? ' (โหมดอัตโนมัติจะรวมเป็นภาคใหม่เมื่อถึงรอบ)' : ''}</p>`,
+                    ctx().POPUP_TYPE.CONFIRM, '', { okButton: 'ยุบภาค', cancelButton: 'ยกเลิก' });
+                if (!ok) return;
+                const now = state();
+                now.arcs = now.arcs.filter(x => x.id !== arc.id);
+                saveState(); renderManagerList(); renderManagerHeader(); refreshUi();
+                return;
+            }
+            return;
+        }
         if (t.closest('.mh_do_export')) { await exportDialog(); return; }
         if (t.closest('.mh_do_carry')) { await popup?.completeCancelled(); await continueInNewChat(); return; }
         if (t.closest('.mh_do_reset')) {
-            const ok = await ctx().callGenericPopup('ลบความจำและเรื่องย่อทั้งหมดของแชทนี้? (ข้อความในแชทไม่ถูกลบ ข้อความเก่าจะกลับไปถูกส่งแบบเต็มจนกว่าจะสรุปใหม่)', ctx().POPUP_TYPE.CONFIRM);
+            const ok = await ctx().callGenericPopup('ลบความจำ ภาค และเรื่องย่อทั้งหมดของแชทนี้? (ข้อความในแชทไม่ถูกลบ ข้อความเก่าจะกลับไปถูกส่งแบบเต็มจนกว่าจะสรุปใหม่)', ctx().POPUP_TYPE.CONFIRM);
             if (!ok) return;
             const cur = state();
-            cur.memories = []; cur.overview = ''; cur.lastEnd = -1; delete cur.skips; delete cur.baseOverview; delete cur.chain;
+            cur.memories = []; cur.arcs = []; cur.overview = ''; cur.lastEnd = -1; delete cur.skips; delete cur.baseOverview; delete cur.chain; delete cur.arcSnooze;
             saveState();
             syncOverview(); renderManagerList(); refreshUi();
             return;
@@ -2631,6 +3324,7 @@ async function openManager() {
             saveState();
             reconcile({ announce: true });
             syncOverview(); renderManagerList(); refreshUi();
+            setTimeout(maybeArcs, 0);
         } else if (t.classList.contains('mh_resum')) {
             if (guardBusy()) return;
             t.classList.add('fa-spin');
@@ -2638,9 +3332,12 @@ async function openManager() {
                 job = { label: 'สรุปช่วงนี้ใหม่', done: 0, total: 1, range: `#${m.start}–#${m.end}` };
                 busy = summarizeRange(m.start, m.end, { replaceId: m.id, updateOverview: false });
                 await busy;
-                toast.ok('สรุปช่วงนี้ใหม่แล้ว');
+                const a = markArcStale(state(), m.id);
+                if (a) saveState();
+                toast.ok(a ? `สรุปช่วงนี้ใหม่แล้ว ภาค "${a.title}" จะถูกเขียนใหม่ตาม` : 'สรุปช่วงนี้ใหม่แล้ว');
             } catch (err) { toast.err(`สรุปไม่สำเร็จ: ${failText(err, `#${m.start}–#${m.end}`)}`, { timeOut: 15000 }); } finally { busy = null; job = null; renderTopbar(); }
             renderManagerList(); refreshUi();
+            setTimeout(maybeArcs, 0);
         }
     });
 
@@ -2900,7 +3597,7 @@ function renderTopbar() {
     const html = `
       <div class="mh_tp_head"><b><span class="mh_icon_slot"></span> Memory Hub</b> <span class="mh_tp_dim">${esc(botName())}</span>
         <i class="fa-solid fa-xmark mh_tp_close" data-mh="close" title="ปิด"></i></div>
-      <div class="mh_tp_stat">สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> จากทั้งหมด ${len} · ยังไม่สรุป <b>${pending}</b> · ความจำ ${st.memories.length} ก้อน</div>
+      <div class="mh_tp_stat">สรุปแล้วถึงข้อความ <b>#${st.lastEnd}</b> จากทั้งหมด ${len} · ยังไม่สรุป <b>${pending}</b> · ความจำ ${st.memories.length} ก้อน${st.arcs.length ? ` · ${st.arcs.length} ภาค` : ''}</div>
       ${s.style === 'custom' ? '<div class="mh_tp_dim">Prompt สรุป: เขียนเองทั้งหมด</div>' : topbarModulesHtml()}
       <div class="mh_tp_dim">${modeLine}</div>
       <div class="mh_tp_off">ไม่ต้องจำ:
@@ -2944,6 +3641,11 @@ function registerCommands() {
             return '';
         },
         helpString: 'Memory Hub: สรุปข้อความช่วงที่เลือกเป็นความจำ 1 ก้อน เช่น <code>/memhub-range 40-75</code> (ไม่ใส่เลขจะเปิดหน้าต่างให้เลือก)',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'memhub-arcs',
+        callback: async () => { if (!state()) toast.warn('เปิดแชทก่อน'); else await runArcs({ force: true }); return ''; },
+        helpString: 'Memory Hub: รวมความจำที่ยังไม่เข้าภาคเป็นภาค (ต้องมีอย่างน้อยครึ่งภาค) และสร้างภาคที่ค้างใหม่',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'memhub-export',
@@ -3068,6 +3770,9 @@ jQuery(() => {
             reconcile({ announce: true });
             refreshUi();
             checkForNewVersion();
+            // an old long chat may be offered arcs; let the chat settle first
+            const opened = ctx().chatId;
+            setTimeout(() => { if (ctx().chatId === opened) maybeArcs(); }, 2500);
         });
         console.log(LOG, `v${VERSION} loaded`);
     } catch (e) {

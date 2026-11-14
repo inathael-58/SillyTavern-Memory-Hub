@@ -182,15 +182,33 @@ export function findGaps(ranges, lastEnd, isEmpty = () => false) {
     return gaps;
 }
 
+// Word lists of memories, by their text: ranking runs every turn, the
+// memories rarely change, and the word breaker is the slow part.
+const docCache = new Map();
+function docTokens(m) {
+    const text = `${m.title ?? ''} ${(m.keys ?? []).join(' ')} ${m.text ?? ''}`;
+    let t = docCache.get(text);
+    if (!t) {
+        if (docCache.size > 4000) docCache.clear();
+        t = tokenize(text);
+        docCache.set(text, t);
+    }
+    return t;
+}
+const normKey = k => String(k ?? '').toLowerCase().trim();
+
 /** Plain BM25 with a bonus for the summarizer's own keys found in the query. */
 export function rankMemories(memories, queryText, { k1 = 1.2, b = 0.75 } = {}) {
-    const docs = memories.map(m => tokenize(`${m.title ?? ''} ${(m.keys ?? []).join(' ')} ${m.text ?? ''}`));
+    const docs = memories.map(docTokens);
     const N = docs.length;
     if (!N) return [];
     const avgdl = docs.reduce((a, d) => a + d.length, 0) / N || 1;
     const df = new Map();
     for (const d of docs) for (const w of new Set(d)) df.set(w, (df.get(w) ?? 0) + 1);
     const idf = w => Math.log(1 + (N - (df.get(w) ?? 0) + 0.5) / ((df.get(w) ?? 0) + 0.5));
+    // in how many memories each key appears, counted once (was once per key per memory)
+    const keyDf = new Map();
+    for (const m of memories) for (const k of new Set((m.keys ?? []).map(normKey))) keyDf.set(k, (keyDf.get(k) ?? 0) + 1);
 
     const qTerms = [...new Set(tokenize(queryText))];
     const qLower = String(queryText ?? '').toLowerCase();
@@ -209,17 +227,176 @@ export function rankMemories(memories, queryText, { k1 = 1.2, b = 0.75 } = {}) {
             hits.push(w);
         }
         for (const key of m.keys ?? []) {
-            const kl = String(key).toLowerCase().trim();
+            const kl = normKey(key);
             if (kl.length < (THAI.test(kl) ? 3 : 2)) continue;
             if (qLower.includes(kl)) {
                 // rarer keys weigh more: a key present in every memory is a name, not a clue
-                const inDocs = memories.filter(x => (x.keys ?? []).some(y => String(y).toLowerCase().trim() === kl)).length;
-                score += 1.5 * Math.log(1 + N / inDocs);
+                score += 1.5 * Math.log(1 + N / (keyDf.get(kl) || 1));
                 hits.push(`🔑${key}`);
             }
         }
         return { memory: m, score, hits };
     }).sort((a, b) => b.score - a.score);
+}
+
+// ---------------------------------------------------------------- arcs (ภาค)
+//
+// An arc folds a run of consecutive memories into one bigger memory, so a long
+// chat has three levels: story-so-far > arcs > memories. Arcs always cover the
+// oldest memories first and never overlap; the newest memories wait until
+// enough of them pile up.
+
+/** How many memories an arc may hold when its size is `target` (the AI picks the cut in between). */
+export function arcBounds(target) {
+    const t = Math.max(2, Math.round(Number(target) || 0));
+    const min = Math.max(2, Math.round(t / 2));
+    const max = Math.max(min + 1, Math.round(t * 1.5));
+    return { target: t, min, max };
+}
+
+/**
+ * Brings arcs in line with the memories that exist now: members that are gone
+ * are dropped (the arc becomes stale and must be rewritten), empty arcs go,
+ * members and arcs are put in story order. Mutates the arcs.
+ * @param {string[]} units ids of the memories arcs may hold, in story order
+ * @param {Array<{id:string, members:string[], stale?:boolean}>} arcs
+ * @returns {{arcs: any[], changed: boolean}}
+ */
+export function normalizeArcs(units, arcs) {
+    const at = new Map(units.map((id, i) => [id, i]));
+    let changed = false;
+    const out = [];
+    const taken = new Set();
+    for (const a of arcs ?? []) {
+        const before = Array.isArray(a.members) ? a.members : [];
+        // a memory belongs to one arc only: the first arc that claims it keeps it
+        const members = [...new Set(before)].filter(id => at.has(id) && !taken.has(id)).sort((x, y) => at.get(x) - at.get(y));
+        if (members.length !== before.length || members.some((id, i) => id !== before[i])) {
+            if (members.length < before.length) a.stale = true;
+            a.members = members;
+            changed = true;
+        }
+        if (!members.length) { changed = true; continue; }
+        for (const id of members) taken.add(id);
+        out.push(a);
+    }
+    const first = a => at.get(a.members[0]);
+    const sorted = [...out].sort((x, y) => first(x) - first(y));
+    if (sorted.some((a, i) => a !== out[i]) || out.length !== (arcs ?? []).length) changed = true;
+    return { arcs: sorted, changed };
+}
+
+/**
+ * The next thing to do with arcs, or null when nothing is due.
+ *   attach  — a few memories sit between (or inside) arcs: add them to that arc (it becomes stale)
+ *   rebuild — rewrite a stale arc from its members
+ *   make    — fold the first memories of `ids` into a new arc; the cut is between min and max
+ * The newest memories (the tail) only make an arc when `max` of them wait
+ * (`target` when not flexible), or `min` when forced by hand.
+ * Expects normalized arcs (see normalizeArcs).
+ * @returns {null | {type:'attach', arcId:string, ids:string[]} | {type:'rebuild', arcId:string}
+ *   | {type:'make', ids:string[], min:number, max:number, tail:boolean, rest:string[]}}
+ */
+export function planArcStep({ units, arcs, target, flexible = true, force = false }) {
+    const b = arcBounds(target);
+    const owner = new Map();
+    for (const a of arcs) for (const id of a.members) owner.set(id, a.id);
+    // runs of memories no arc holds yet
+    const runs = [];
+    let cur = null;
+    units.forEach((id, i) => {
+        if (owner.has(id)) { cur = null; return; }
+        if (!cur) runs.push(cur = { ids: [], before: owner.get(units[i - 1]) ?? null, after: null });
+        cur.ids.push(id);
+    });
+    for (const r of runs) {
+        const last = units.indexOf(r.ids.at(-1));
+        r.after = owner.get(units[last + 1]) ?? null;
+    }
+
+    // 1. small runs between arcs, and anything inside an arc, join that arc
+    for (const r of runs) {
+        if (!r.after) continue;
+        if (r.before && r.before === r.after) return { type: 'attach', arcId: r.before, ids: r.ids };
+        if (r.ids.length < b.min) return { type: 'attach', arcId: r.before ?? r.after, ids: r.ids };
+    }
+    // 2. stale arcs
+    const stale = arcs.find(a => a.stale);
+    if (stale) return { type: 'rebuild', arcId: stale.id };
+    // 3. bigger runs before an arc must be used up completely
+    for (const r of runs) {
+        if (!r.after) continue;
+        const L = r.ids.length;
+        if (flexible) {
+            if (L <= b.max) return { type: 'make', ids: r.ids, min: L, max: L, tail: false, rest: [] };
+            const hi = Math.min(b.max, L - b.min);
+            return { type: 'make', ids: r.ids.slice(0, hi), min: Math.min(b.min, hi), max: hi, tail: false, rest: r.ids.slice(hi) };
+        }
+        if (L < b.target + b.min) return { type: 'make', ids: r.ids, min: L, max: L, tail: false, rest: [] };
+        return { type: 'make', ids: r.ids.slice(0, b.target), min: b.target, max: b.target, tail: false, rest: r.ids.slice(b.target) };
+    }
+    // 4. the newest memories
+    const tail = runs.find(r => !r.after);
+    if (!tail) return null;
+    const L = tail.ids.length;
+    if (flexible) {
+        if (L < (force ? b.min : b.max)) return null;
+        const hi = Math.min(L, b.max);
+        return { type: 'make', ids: tail.ids.slice(0, hi), min: b.min, max: hi, tail: true, rest: tail.ids.slice(hi) };
+    }
+    if (L < (force ? b.min : b.target)) return null;
+    const n = Math.min(L, b.target);
+    return { type: 'make', ids: tail.ids.slice(0, n), min: n, max: n, tail: true, rest: tail.ids.slice(n) };
+}
+
+/** About how many arcs `waiting` memories at the end make, as [low, high] for a "4–5" label. */
+export function estimateArcs(waiting, target) {
+    const t = Math.max(2, target);
+    return [Math.max(1, Math.round((waiting - t) / t)), Math.max(1, Math.round(waiting / t))];
+}
+
+/**
+ * Parses an arc answer: <arc> with "cut:" plus the memory fields, and an optional <overview>.
+ * @returns {{cut:number|null, title:string, keys:string[], text:string, overview:string}}
+ */
+export function parseArc(raw) {
+    const txt = String(raw ?? '')
+        .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '')
+        .replace(/<(\/?)arc>/gi, '<$1memory>');
+    let cut = null;
+    const c = /^\s*(?:cut|ตัด|ends? at)\s*[:：]\s*#?\[?(\d+)/im.exec(txt);
+    if (c) cut = parseInt(c[1], 10);
+    const p = parseSummary(txt.replace(/^\s*(?:cut|ตัด|ends? at)\s*[:：].*$/im, ''));
+    return { cut, ...p };
+}
+
+/** A cut the model gave, kept inside [min, max]; `fallback` when it gave none. */
+export function clampCut(cut, min, max, fallback) {
+    const n = Number.isInteger(cut) ? cut : fallback;
+    return Math.min(max, Math.max(min, Number.isInteger(n) ? n : max));
+}
+
+/** "~800 messages ago", rounded so the label stays the same for a while. */
+export function agoText(n) {
+    if (!Number.isFinite(n) || n < 0) return '';
+    if (n < 30) return 'just before the recent messages';
+    const step = n < 200 ? 10 : n < 1000 ? 50 : 100;
+    return `~${Math.round(n / step) * step} messages ago`;
+}
+
+/**
+ * The label in front of a recalled memory or arc: where it sits in the story,
+ * so the model can tell old facts from current ones.
+ * @param {{kind:'arc'|'memory', index:number, total:number, start?:number, end?:number, chatLength:number, earlier?:boolean}} o
+ */
+export function ageTag({ kind, index, total, start = -1, end = -1, chatLength, earlier = false }) {
+    const parts = [`${kind === 'arc' ? 'Arc' : 'Memory'} ${index}/${total}`];
+    if (end >= 0) {
+        parts.push(start >= 0 && start !== end ? `#${start}–#${end}` : `#${end}`);
+        const ago = agoText(chatLength - 1 - end);
+        if (ago) parts.push(ago);
+    } else if (earlier) parts.push('from an earlier chat');
+    return `[${parts.join(' · ')}]`;
 }
 
 /**
@@ -257,9 +434,10 @@ export function cleanKeys(keys, names = []) {
  * Did the answer finish? A reply cut off by the token limit (common when a
  * "thinking" model spends the budget on reasoning) lacks its closing tags.
  */
-export function isComplete(raw, { memory = true, overview = false } = {}) {
+export function isComplete(raw, { memory = true, overview = false, arc = false } = {}) {
     const t = String(raw ?? '');
     if (memory && /<memory>/i.test(t) && !/<\/memory>/i.test(t)) return false;
+    if (arc && !/<\/arc>/i.test(t)) return false;
     if (overview && !/<\/overview>/i.test(t)) return false;
     return true;
 }

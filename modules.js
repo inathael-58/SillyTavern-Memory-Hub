@@ -241,17 +241,71 @@ summary:
 </memory>{{overview_format}}`;
 }
 
-/** The story-so-far instruction: free prose, or fixed headings when modules ask for them. */
-export function buildOverviewRule(mods) {
+/**
+ * The story-so-far instruction: free prose, or fixed headings when modules ask for them.
+ * `anchor` = written again from the arcs instead of updated from the last version
+ * (keeps the story-so-far from drifting over hundreds of rewrites).
+ */
+export function buildOverviewRule(mods, { anchor = false } = {}) {
     const heads = mods.map(m => m.overview).filter(Boolean);
+    const source = anchor
+        ? 'write the story so far again from the arcs (EARLIER ARCS, and the arc you just wrote if any) and every memory given (MEMORIES and LATER MEMORIES, also those after the cut). Use PREVIOUS OVERVIEW only for details these lack (who is who, disguises, secrets still hidden, the current moment)'
+        : 'rewrite PREVIOUS OVERVIEW';
     if (!heads.length) {
-        return '- overview: rewrite PREVIOUS OVERVIEW so it also covers the new memory. It is the story so far in at most {{overview_words}} words: who is who, where things stand, what happened that still matters, where they are now, open threads. Drop details that no longer matter, but never drop who is who (identities, disguises, who is in which body) or a secret that is still hidden.';
+        return anchor
+            ? `- overview: ${source}. It is the story so far in at most {{overview_words}} words: who is who, where things stand, what happened that still matters, where they are now, open threads. Never drop who is who (identities, disguises, who is in which body) or a secret that is still hidden.`
+            : '- overview: rewrite PREVIOUS OVERVIEW so it also covers the new memory. It is the story so far in at most {{overview_words}} words: who is who, where things stand, what happened that still matters, where they are now, open threads. Drop details that no longer matter, but never drop who is who (identities, disguises, who is in which body) or a secret that is still hidden.';
     }
     const who = mods.some(m => m.id === 'ensemble') ? [] : ['Who is who: one line per important character (role, origin, occupation, family ties, current body or disguise)'];
     const all = [...who, ...heads, 'Now: where everyone is and what is happening at this moment', 'Open threads: promises, plans and unresolved matters'];
-    return `- overview: rewrite PREVIOUS OVERVIEW as the CURRENT STATE of the story, at most {{overview_words}} words in total, under these headings (skip a heading if there is nothing for it):
+    const lead = anchor ? `${source}. Write it as the CURRENT STATE of the story,` : 'rewrite PREVIOUS OVERVIEW as the CURRENT STATE of the story,';
+    return `- overview: ${lead} at most {{overview_words}} words in total, under these headings (skip a heading if there is nothing for it):
 ${all.map(h => `  ${h}`).join('\n')}
   Write the headings in the story's language. Drop what is resolved and no longer matters, but never drop who is who (identities, disguises, who is in which body) or a secret that is still hidden.`;
+}
+
+/**
+ * The prompt that folds memories into one arc (ภาค). The model picks where the
+ * arc ends ({{arc_min}}–{{arc_max}}) unless both are the same number.
+ * Filled at call time: {{arc_min}} {{arc_max}} {{arc_words}} {{arc_bullets}}
+ * {{overview_rule}} {{overview_format}} {{char}} {{user}}.
+ * @param {PromptModule[]} mods
+ * @param {{group?: boolean, fixed?: boolean}} opt
+ */
+export function buildArcPrompt(mods, { group = false, fixed = false } = {}) {
+    const keep = mods.flatMap(m => m.keep ?? []).slice(0, 8);
+    const keyKinds = ['places', 'objects', 'events', 'nicknames', ...mods.map(m => m.keys).filter(Boolean)];
+    const who = group || mods.some(m => m.id === 'ensemble')
+        ? 'an ongoing story with {{user}} and several characters'
+        : 'an ongoing roleplay between {{user}} and {{char}}';
+    const cutRule = fixed
+        ? '- The arc is memories 1–{{arc_max}}. Write cut: {{arc_max}}.'
+        : `- First choose where the arc ends. cut = the number of the last memory in the arc, from {{arc_min}} to {{arc_max}}.
+  Cut where the story turns: a time skip, a move to a new main place, the main conflict resolved or a new goal begins, a big change in a relationship.
+  Never cut in the middle of a scene that goes on in the next memory. If nothing turns, cut near the middle of the range.`;
+    return `You are the memory keeper of ${who}.
+MEMORIES below are consecutive memories of the story, numbered in story order. Fold the first of them into one ARC: a large part of the story, like a part of a novel.
+
+Rules:
+${cutRule}
+- Then write the arc from memories 1 to cut only. Later memories are context, never part of the arc.
+- Write in the same language the story is written in.
+- Keep what still matters for the rest of the story: turning points and their consequences, who is who and how relationships stand, promises, secrets, important items and places, threads still open${keep.length ? `, and:
+${keep.map(k => `  • ${k}`).join('\n')}` : '.'}
+- If something changed inside the arc, keep only how it ended and say that it changed (e.g. "Anna and Ben went from rivals to lovers"). Never keep two facts that contradict each other.
+- Always write names in full instead of "he/she".
+- summary: about {{arc_bullets}} bullets, one short sentence each (about {{arc_words}} words in total; an arc of more memories gets the upper end), in story order.
+- title: a short name for this part of the story.
+- keys: 4-10 names of concrete things someone would say when this part of the story becomes relevant again (${[...new Set(keyKinds.join(', ').split(/,\s*/))].join(', ')}). Never {{user}} or {{char}} alone.
+{{overview_rule}}
+Answer in exactly this format and nothing else:
+<arc>
+cut: <number>
+title: <short title>
+keys: <comma separated>
+summary:
+- ...
+</arc>{{overview_format}}`;
 }
 
 /** Extra room the chosen modules need on top of the base settings. */
