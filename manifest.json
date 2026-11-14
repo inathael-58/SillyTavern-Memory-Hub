@@ -6,8 +6,8 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Kitima",
-    "version": "1.13.2",
+    "version": "2.0.0",
     "homePage": "https://github.com/inathael-58/SillyTavern-Memory-Hub",
     "generate_interceptor": "memoryHub_intercept",
-    "description": "One place for long-chat memory: summarizes old messages in chunks, keeps a short story-so-far, recalls only the memories that matter right now (no vector setup, Thai-aware) and stops sending already-summarized messages."
+    "description": "One place for long-chat memory: summarizes old messages in chunks, folds them into story arcs in very long chats, keeps a short story-so-far, recalls only the memories that matter right now (no vector setup, Thai-aware) and stops sending already-summarized messages."
 }
