@@ -216,6 +216,7 @@
 .mh_export { text-align: left; }
 .mh_import .mh_file_btn { margin: 0.2em 0 0.4em; }
 .mh_card .mh_trunc { font-size: 0.8em; color: #f5a524; white-space: nowrap; }
+.mh_card .mh_trunc.mh_soft { color: inherit; opacity: 0.7; }
 
 /* ---------------------------------------------------------------- 1.5 module tips + top bar modules */
 .mh_modinfo { font-size: 0.85em; opacity: 0.85; min-height: 2.6em; padding: 0.3em 0.5em; border-left: 2px solid var(--SmartThemeQuoteColor, #e18a24); margin-bottom: 0.4em; line-height: 1.45; }

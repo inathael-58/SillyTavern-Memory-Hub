@@ -26,7 +26,7 @@ import { allModules, BUILTIN_MODULES, buildOverviewRule, buildPrompt, extraWords
 
 const MODULE = 'memory_hub';
 const LOG = '[MemoryHub]';
-const VERSION = '1.11.0'; // keep in sync with manifest.json
+const VERSION = '1.12.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -111,6 +111,7 @@ const DEFAULTS = Object.freeze({
     offBots: {},            // 'group:<id>' -> true: never summarize on its own (characters use the memhub-off card tag)
     customModules: [],      // user-made modules (same shape as BUILTIN_MODULES)
     autoWords: true,        // add the modules' extra words to the lengths below
+    gentle: 'auto',         // intimate/violent scenes in memories: auto (plain only after a content filter) | always | off
     sources: null,          // ordered list: 'main' or Connection Profile ids
     timeoutSec: 120,
     overviewPosition: 'prompt', // 'prompt' | 'chat'
@@ -646,8 +647,18 @@ function summaryTemplate() {
     return buildPrompt(activeModules(), { group: isGroup() });
 }
 
-/** Summarizes chat[start..end] into one memory (and refreshes the overview). */
-async function summarizeRange(start, end, { replaceId = null, updateOverview = true } = {}) {
+/**
+ * Added to the summary prompt (built-in or custom) in "gentle" mode: intimate
+ * and violent scenes become one plain line. The memory keeps what happened and
+ * what it changed, and a later summary is not stopped by text it carries over.
+ */
+const GENTLE_RULE = `Content rule: write intimate, sexual or violent moments as one plain, non-graphic line that keeps only what happened and what it changed (e.g. "A and B slept together for the first time", "A was stabbed in the side and is recovering"). No body descriptions, no explicit words, no quotes from those scenes. The same goes for the overview.`;
+
+/**
+ * One summary call for chat[start..end]: one memory, plus the overview when
+ * `context` is on. `context` = send PREVIOUS OVERVIEW and PREVIOUS MEMORY.
+ */
+async function summarizeOnce(start, end, { replaceId = null, updateOverview = true, gentle = false, context = true } = {}) {
     const s = settings();
     const st = state();
     if (!st) throw new Error('ยังไม่ได้เปิดแชท');
@@ -656,14 +667,16 @@ async function summarizeRange(start, end, { replaceId = null, updateOverview = t
     const body = transcript(start, end);
     if (!body.trim()) return null;
 
-    const withOverview = s.overviewEnabled && updateOverview;
-    const prev = latestOf(st.memories.filter(m => (m.source !== 'auto' || m.end < start) && String(m.text ?? '').trim()));
+    const withOverview = s.overviewEnabled && updateOverview && context;
+    const prev = context ? latestOf(st.memories.filter(m => (m.source !== 'auto' || m.end < start) && String(m.text ?? '').trim())) : null;
     const parts = [];
     if (withOverview) parts.push(`PREVIOUS OVERVIEW:\n${st.overview.trim() || '(none yet — this is the start of the story)'}`);
     if (prev) parts.push(`PREVIOUS MEMORY (for continuity, do not repeat it):\n${memoryBlock(prev)}`);
     parts.push(`NEW MESSAGES (#${start}–#${end}):\n${body}`);
 
-    const raw = await callModel(fill(summaryTemplate(), withOverview), ctx().substituteParams(parts.join("\n\n")), wordBudget().response,
+    let system = fill(summaryTemplate(), withOverview);
+    if (gentle) system += `\n\n${GENTLE_RULE}`;
+    const raw = await callModel(system, ctx().substituteParams(parts.join("\n\n")), wordBudget().response,
         out => !!parseSummary(out).text, out => isComplete(out, { overview: withOverview }));
     // flag the memory only when the memory part itself was cut (a missing overview just keeps the old one)
     const partial = lastCallPartial && !isComplete(raw);
@@ -675,10 +688,10 @@ async function summarizeRange(start, end, { replaceId = null, updateOverview = t
     let mem;
     if (replaceId) {
         mem = cur.memories.find(m => m.id === replaceId);
-        if (mem) Object.assign(mem, { title: parsed.title || mem.title, keys: keys.length ? keys : mem.keys, text: parsed.text, ts: Date.now(), truncated: partial || undefined, blocked: undefined });
+        if (mem) Object.assign(mem, { title: parsed.title || mem.title, keys: keys.length ? keys : mem.keys, text: parsed.text, ts: Date.now(), truncated: partial || undefined, blocked: undefined, gentle: gentle || undefined });
     }
     if (!mem) {
-        mem = { id: uid(), start, end, title: parsed.title || `#${start}–#${end}`, keys, text: parsed.text, pinned: false, source: 'auto', ts: Date.now(), ...(partial ? { truncated: true } : {}) };
+        mem = { id: uid(), start, end, title: parsed.title || `#${start}–#${end}`, keys, text: parsed.text, pinned: false, source: 'auto', ts: Date.now(), ...(partial ? { truncated: true } : {}), ...(gentle ? { gentle: true } : {}) };
         cur.memories.push(mem);
         cur.memories.sort((a, b) => (a.start - b.start) || (a.ts - b.ts));
         cur.lastEnd = Math.max(cur.lastEnd, end);
@@ -690,6 +703,141 @@ async function summarizeRange(start, end, { replaceId = null, updateOverview = t
         : (latestOf(cur.memories.filter(m => m.source === 'auto' && m.end < start))?.overviewAfter ?? cur.baseOverview ?? '');
     saveState();
     return mem;
+}
+
+/** Summarizes chat[start..end] into one memory (and refreshes the overview); a blocked range is rescued. */
+async function summarizeRange(start, end, opt = {}) {
+    const gentle = settings().gentle === 'always';
+    try {
+        const mem = await summarizeOnce(start, end, { ...opt, gentle });
+        if (contextSuspect === ctx().chatId) contextSuspect = null;
+        return mem;
+    } catch (e) {
+        if (!e?.blocked) throw e;
+        return await rescueBlocked(start, end, opt, e);
+    }
+}
+
+// ---------------------------------------------------------------- content-filter rescue
+
+/** A range this small that is still blocked is left as an empty ⛔ memory. */
+const RESCUE_LEAF = 3;
+/** Most summary calls one rescue may spend (free tiers count requests). */
+const RESCUE_CALLS = 10;
+/** Split attempts that may fail before anything passes; then the whole range is probably the problem. */
+const RESCUE_GIVE_UP = 3;
+/** Chat whose overview or previous memory seems to be what the filter stops. */
+let contextSuspect = null;
+let gentleRescues = 0;
+
+function blockedPlaceholder(a, b) {
+    const st = state();
+    const mem = { id: uid(), start: a, end: b, title: `#${a}–#${b} (ถูกบล็อก)`, keys: [], text: '', pinned: false, source: 'auto', blocked: true, ts: Date.now(), overviewAfter: st.overview };
+    st.memories.push(mem);
+    st.memories.sort((x, y) => (x.start - y.start) || (x.ts - y.ts));
+    st.lastEnd = Math.max(st.lastEnd, b);
+    saveState();
+    return mem;
+}
+
+/**
+ * A content filter stopped the summary of chat[start..end]. In order:
+ *   1. the same range with GENTLE_RULE (unless the user turned it off or it was on already);
+ *   2. without PREVIOUS OVERVIEW / PREVIOUS MEMORY: a text carried over from an
+ *      earlier summary can stop every summary after it;
+ *   3. halves, again and again, until only the few messages the filter stops
+ *      are left; those become an empty ⛔ memory and the rest is summarized.
+ * A re-summary of one memory (🔄) never splits it.
+ */
+async function rescueBlocked(start, end, opt, firstError) {
+    const mode = settings().gentle ?? 'auto';
+    const gentle = mode !== 'off';
+    const chatId = ctx().chatId;
+    const range = `#${start}–#${end}`;
+    let calls = 0;
+    const attempt = async (a, b, o) => {
+        calls++;
+        if (job) { job.range = `#${a}–#${b}`; renderTopbar(); }
+        try { return { mem: await summarizeOnce(a, b, { ...opt, ...o }) }; } catch (e) {
+            if (!e?.blocked) throw e;
+            return { error: e };
+        }
+    };
+
+    // was anything carried over from earlier summaries in that request?
+    const carried = (settings().overviewEnabled && opt.updateOverview !== false)
+        || state().memories.some(m => (m.source !== 'auto' || m.end < start) && String(m.text ?? '').trim());
+    const tries = [];
+    if (mode === 'auto' && (contextSuspect !== chatId || !carried)) tries.push({ gentle: true, context: true });
+    if (carried) tries.push({ gentle, context: false });
+    for (const t of tries) {
+        const r = await attempt(start, end, t);
+        if (r.error) continue;
+        if (!t.context) {
+            contextSuspect = chatId;
+            toast.warn(`ช่วง ${range} ผ่านเมื่อไม่ส่งเรื่องย่อ/ความจำก่อนหน้าไปด้วย — เรื่องย่อหรือความจำก้อนก่อนอาจมีข้อความที่ตัวกรองไม่ชอบ ทำให้ก้อนถัดไปติดต่อกัน\nแตะเพื่อเปิดจัดการความจำ แล้วแก้เรื่องย่อหรือกด 🔄 ที่ความจำก้อนก่อนหน้า`,
+                { timeOut: 20000, extendedTimeOut: 10000, onclick: () => openManager() });
+        } else {
+            gentleRescues++;
+            const offer = mode === 'auto' && gentleRescues >= 2;
+            toast.info(`ช่วง ${range} ติดตัวกรองเนื้อหา สรุปใหม่แบบไม่ลงรายละเอียดฉากแรง/เลิฟซีนให้แล้ว${offer ? '\nติดบ่อย? แตะเพื่อเขียนแบบนี้ทุกครั้ง (ไม่ต้องเสียการเรียก API ซ้ำ)' : ''}`,
+                { timeOut: offer ? 15000 : 8000, ...(offer ? { onclick: () => { settings().gentle = 'always'; saveSettings(); refreshUi(); toast.ok('ต่อไปจะเขียนฉากแรง/เลิฟซีนแบบไม่ลงรายละเอียดทุกครั้ง เปลี่ยนได้ในตั้งค่า → Prompt สรุป'); } } : {}) });
+        }
+        return r.mem;
+    }
+    if (opt.replaceId || end - start + 1 <= RESCUE_LEAF) throw firstError;
+
+    // 3. split
+    const holes = [];   // ⛔ memories made here; neighbours are merged into one
+    let last = null;
+    let made = 0;
+    let fails = 0;
+    const lastEndBefore = state().lastEnd;
+    const prevSize = rangeSize;
+    const GIVE_UP = Symbol('give up');
+    const hole = (a, b) => {
+        const h = holes.at(-1);
+        if (h && h.end === a - 1 && state().memories.includes(h)) {
+            Object.assign(h, { end: b, title: `#${h.start}–#${b} (ถูกบล็อก)` });
+            state().lastEnd = Math.max(state().lastEnd, b);
+            saveState();
+        } else holes.push(blockedPlaceholder(a, b));
+        last = holes.at(-1);
+    };
+    const walk = async (a, b) => {
+        if (cancelRequested || ctx().chatId !== chatId) return;
+        const n = b - a + 1;
+        if (n <= RESCUE_LEAF || calls >= RESCUE_CALLS) return hole(a, b);
+        const mid = a + Math.floor(n / 2) - 1;
+        for (const [x, y] of [[a, mid], [mid + 1, b]]) {
+            if (cancelRequested || ctx().chatId !== chatId) return;
+            if (calls >= RESCUE_CALLS) { hole(x, y); continue; }
+            if (prevSize) rangeSize = y - x + 1;
+            const r = await attempt(x, y, { gentle, context: true });
+            if (r.error) {
+                if (!made && ++fails >= RESCUE_GIVE_UP) throw GIVE_UP;
+                await walk(x, y);
+            } else if (r.mem) { last = r.mem; made++; } else { const st = state(); if (st) { st.lastEnd = Math.max(st.lastEnd, y); saveState(); } }
+        }
+    };
+    try { await walk(start, end); } catch (e) {
+        if (e !== GIVE_UP) throw e;
+        // nothing passes: leave the whole range to the user, as before
+        const st = state();
+        if (st && ctx().chatId === chatId) {
+            st.memories = st.memories.filter(m => !holes.includes(m));
+            st.lastEnd = lastEndBefore;
+            saveState();
+        }
+        throw firstError;
+    } finally { rangeSize = prevSize; }
+    // stopped before anything was written: leave the range for the next run
+    if (!last && (cancelRequested || ctx().chatId !== chatId)) throw new Error('หยุดระหว่างแบ่งช่วงที่ติดตัวกรอง');
+    if (holes.length) {
+        toast.warn(`ช่วง ${range} ติดตัวกรองเนื้อหา แบ่งสรุปให้แล้ว ${made} ก้อน ข้ามไว้ ${holes.map(h => `#${h.start}–#${h.end}`).join(', ')} (⛔ ความจำว่าง)\nแตะเพื่อเปิดจัดการความจำและเขียนเอง`,
+            { timeOut: 20000, extendedTimeOut: 10000, onclick: () => openManager() });
+    }
+    return last;
 }
 
 /**
@@ -1445,7 +1593,8 @@ async function buildExport({ withSource = false } = {}) {
             keepRaw: s.keepRaw,
             mode: s.mode,
             quotaBoost: s.quotaBoost,
-            text: fill(summaryTemplate(), s.overviewEnabled),
+            gentle: s.gentle,
+            text: fill(summaryTemplate(), s.overviewEnabled) + (s.gentle === 'always' ? `\n\n${GENTLE_RULE}` : ''),
         },
         recall: { topK: s.topK, budget: wordBudget().recall, queryDepth: s.queryDepth, lastInjection },
         stats: {
@@ -1755,6 +1904,12 @@ function renderSettings() {
               <option value="modules">ประกอบจากโมดูลตามบอท (แนะนำ)</option>
               <option value="custom">เขียนเองทั้งหมด</option>
             </select></label>
+          <label class="mh_row" title="ฉากเลิฟซีนหรือความรุนแรงในความจำ: เขียนละเอียดตามปกติ หรือเขียนสั้น ๆ บรรทัดเดียวแบบไม่ลงรายละเอียด (ช่วยให้ไม่ติดตัวกรองเนื้อหา เช่น PROHIBITED_CONTENT ของ Gemini)"><span>ฉากแรง / เลิฟซีนในความจำ</span>
+            <select id="mh_gentle" class="text_pole">
+              <option value="auto">ละเอียดตามปกติ เขียนแบบเบาเมื่อติดตัวกรอง (แนะนำ)</option>
+              <option value="always">เขียนแบบเบาเสมอ (Lite)</option>
+              <option value="off">ละเอียดเสมอ ไม่สลับให้</option>
+            </select></label>
           <div id="mh_modbox" class="mh_modbox">
             <div class="mh_modhead"><b>โมดูลของบอทนี้:</b> <span id="mh_botname"></span></div>
             <small id="mh_modsrc" class="mh_hint"></small>
@@ -1866,6 +2021,7 @@ function renderSettings() {
     bindNum('#mh_recdepth', 'recallDepth', 0, 50);
     bindNum('#mh_maxchars', 'maxMessageChars', 500, 50000);
     bindVal('#mh_ovpos', 'overviewPosition');
+    bindVal('#mh_gentle', 'gentle');
     bindVal('#mh_recpos', 'recallPosition');
     bindVal('#mh_ovtpl', 'overviewTemplate');
     bindVal('#mh_rectpl', 'recallTemplate');
@@ -1987,7 +2143,7 @@ async function previewPrompt() {
     const { Popup, POPUP_TYPE } = ctx();
     const r = resolveModules();
     const names = activeModules().map(m => m.name).join(', ') || '(ไม่มี — ใช้แค่พื้นฐาน)';
-    const text = fill(summaryTemplate(), s.overviewEnabled);
+    const text = fill(summaryTemplate(), s.overviewEnabled) + (s.gentle === 'always' ? `\n\n${GENTLE_RULE}` : '');
     const html = `<div class="mh_preview">
       <h3>Prompt สรุปของ ${esc(botName() || 'บอทนี้')}</h3>
       <p>${s.style === 'custom' ? 'แบบเขียนเองทั้งหมด' : `โมดูล: <b>${esc(names)}</b> (${r.from === 'bot' ? 'เลือกเอง' : r.from === 'tags' ? 'จากแท็ก' : 'ค่าเริ่มต้น'})`} · ${await countTokens(text)} โทเคน</p>
@@ -2295,6 +2451,7 @@ function memoryCard(m, recalled) {
         <input class="text_pole mh_title" value="${esc(m.title)}" placeholder="ชื่อ">
         <span class="mh_range" title="${esc(m.origin?.chat ?? '')}">${esc(range)}</span>
         ${m.blocked && !String(m.text ?? '').trim() ? '<span class="mh_trunc" title="ช่วงนี้ถูกตัวกรองเนื้อหาของผู้ให้บริการบล็อก จึงข้ามไว้ — เขียนความจำเองในช่องด้านล่าง หรือกด 🔄 เพื่อลองใหม่">⛔ ถูกบล็อก</span>' : ''}
+        ${m.gentle ? '<span class="mh_trunc mh_soft" title="ช่วงนี้ติดตัวกรองเนื้อหา จึงเขียนฉากแรง/เลิฟซีนแบบไม่ลงรายละเอียด แก้เพิ่มเองได้ในช่องด้านล่าง">🕊 แบบเบา</span>' : ''}
         ${m.truncated ? '<span class="mh_trunc" title="คำตอบของโมเดลถูกตัดกลางคัน ความจำนี้อาจไม่ครบ — เพิ่ม Response length แล้วกด 🔄">⚠ ไม่ครบ</span>' : ''}
         <i class="fa-solid fa-thumbtack mh_icon mh_pin" title="ปักหมุด: ใส่ใน prompt ทุกครั้ง"></i>
         ${m.end >= 0 && m.source === 'auto' ? '<i class="fa-solid fa-rotate mh_icon mh_resum" title="สรุปช่วงนี้ใหม่ (เช่น หลังแก้ข้อความ)"></i>' : ''}
