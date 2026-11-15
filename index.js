@@ -26,6 +26,7 @@
  */
 
 import { ageTag, arcBounds, blockKind, clampCut, cleanKeys, cleanText, estimateArcs, findGaps, hasSegmenter, isComplete, nextChunk, normalizeArcs, parseArc, parseMany, parseSummary, planArcStep, rankMemories } from './lib.js';
+import { installThemePalette } from './theme-palette.js';
 import { allModules, BUILTIN_MODULES, buildArcPrompt, buildOverviewRule, buildPrompt, extraWords, modulesFromTags } from './modules.js';
 
 const MODULE = 'memory_hub';
@@ -33,7 +34,7 @@ const MODULE = 'memory_hub';
 const PRESET_SRC = 'main-preset';
 const isBuiltinSource = id => id === 'main' || id === PRESET_SRC;
 const LOG = '[MemoryHub]';
-const VERSION = '2.0.0'; // keep in sync with manifest.json
+const VERSION = '2.0.1'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -3684,7 +3685,7 @@ function registerCommands() {
 
 const BASE_URL = new URL('.', import.meta.url);
 /** Every file of the extension, so a hard refresh can replace all of them in the browser cache. */
-const FILES = ['index.js', 'lib.js', 'modules.js', 'style.css', 'manifest.json'];
+const FILES = ['index.js', 'lib.js', 'modules.js', 'theme-palette.js', 'style.css', 'manifest.json'];
 let remoteVersion = '';
 let versionCheckedAt = 0;
 let versionToastShown = false;
@@ -3747,6 +3748,8 @@ function watchVersion() {
 }
 
 jQuery(() => {
+    // สีที่อ่านออกเสมอ: แผงข้อมูลทึบ สีเน้นตัดกับพื้นจริง (ดู theme-palette.js)
+    try { installThemePalette({ prefix: 'mhub' }); } catch (err) { console.warn('[Memory Hub] theme palette', err); }
     try {
         settings();
         renderSettings();
