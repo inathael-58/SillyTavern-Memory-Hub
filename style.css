@@ -263,3 +263,15 @@
 .mh_card .mh_arc_members { padding-left: 0.6em; border-left: 2px solid var(--SmartThemeBorderColor, #555); margin-top: 0.2em; }
 .mh_card .mh_arc_members .mh_card { margin-bottom: 0.4em; }
 .memory-hub-settings .mh_hint_inline { opacity: 0.75; }
+
+/* แม่แบบสีที่อ่านออกเสมอ (theme-palette.js) — เฉพาะส่วนที่แสดงข้อมูล: พื้นทึบ และสีเน้น/ตัวอักษรตัดกับพื้นจริง
+   ทำงานเมื่อคำนวณสีสำเร็จแล้วเท่านั้น (<html class="mhub-pal">) ถ้าไม่สำเร็จจะใช้สีธีมตรง ๆ แบบเดิม
+   ปุ่มและป้ายตัวเลขบนแถบบนไม่อยู่ในนี้ — ให้กลืนกับไอคอนอื่นของ ST */
+html.mhub-pal :is(#mh_topbar_panel, #mh_ownbar, .mh_manager, .memory-hub-settings) {
+    --SmartThemeBlurTintColor: var(--mhub-p-surface);
+    --SmartThemeBodyColor: var(--mhub-p-fg);
+    --SmartThemeQuoteColor: var(--mhub-p-accent-text);
+    --SmartThemeEmColor: var(--mhub-p-em);
+    --SmartThemeUnderlineColor: var(--mhub-p-underline);
+    --SmartThemeBorderColor: var(--mhub-p-line);
+}
