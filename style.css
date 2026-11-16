@@ -250,6 +250,9 @@
 #mh_topbar_panel .mh_tp_off label { display: inline-flex; align-items: center; gap: 0.3em; cursor: pointer; }
 #mh_topbar_panel .mh_tp_off input { margin: 0; }
 
+#mh_otherbox { margin: 0.4em 0; }
+#mh_otherbox > b { display: block; margin-bottom: 0.15em; font-size: 0.95em; opacity: 0.9; }
+
 /* ---------------------------------------------------------------- 2.0 arcs (ภาค) */
 .mh_manager .mh_sub_head { margin: 0.8em 0 0.35em; font-weight: bold; opacity: 0.9; }
 .mh_manager .mh_sub_head small { font-weight: normal; opacity: 0.7; }

@@ -25,7 +25,7 @@
  * Profiles); when one fails, times out or answers empty, the next is tried.
  */
 
-import { ageTag, arcBounds, blockKind, clampCut, cleanKeys, cleanText, estimateArcs, findGaps, hasSegmenter, isComplete, nextChunk, normalizeArcs, parseArc, parseMany, parseSummary, planArcStep, rankMemories } from './lib.js';
+import { ageTag, arcBounds, blockKind, clampCut, cleanKeys, cleanText, estimateArcs, findGaps, hasSegmenter, isComplete, isHiddenStory, nextChunk, normalizeArcs, parseArc, parseMany, parseSummary, planArcStep, positionalIndex, promptIndex, rankMemories } from './lib.js';
 import { installThemePalette } from './theme-palette.js';
 import { allModules, BUILTIN_MODULES, buildArcPrompt, buildOverviewRule, buildPrompt, extraWords, modulesFromTags } from './modules.js';
 
@@ -34,7 +34,7 @@ const MODULE = 'memory_hub';
 const PRESET_SRC = 'main-preset';
 const isBuiltinSource = id => id === 'main' || id === PRESET_SRC;
 const LOG = '[MemoryHub]';
-const VERSION = '2.0.1'; // keep in sync with manifest.json
+const VERSION = '2.1.0'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -108,6 +108,8 @@ const DEFAULTS = Object.freeze({
     quotaBoost: 1,          // multiplies memory length and recall budget
     keepRaw: 12,            // newest messages that are never summarized yet
     trimSummarized: true,   // drop summarized messages from the prompt
+    summarizeHidden: true,  // hidden messages (/hide, or hidden by another summary tool) are still story: summarize them
+    foreignQuiet: false,    // add memories to other extensions' background (quiet) requests too
     overviewEnabled: true,
     overviewWords: 250,
     memoryWords: 120,
@@ -494,6 +496,44 @@ function toggleOff(scope, on) {
     refreshUi();
 }
 
+/** This chat already has a story summary from somewhere else: do not send ours too. */
+function setWithOther(on) {
+    const st = state();
+    if (!st) { toast.warn('เปิดแชทก่อน'); return; }
+    if (on) { st.withOther = true; st.otherAsked = true; } else delete st.withOther;
+    saveState();
+    toast.info(on
+        ? 'แชทนี้จะไม่ส่งเรื่องย่อของ Memory Hub (ใช้สรุปจากที่อื่นแทน) ความจำที่ดึงตามความเกี่ยวข้องยังส่งตามปกติ'
+        : 'แชทนี้กลับมาส่งเรื่องย่อของ Memory Hub แล้ว');
+    refreshUi();
+}
+
+/**
+ * A summary tool that keeps its summary in the card's main prompt rewrites that
+ * prompt as the chat goes on. When it grows noticeably during a chat, offer once
+ * to stop sending our story-so-far there. Fingerprints stay in memory only, so
+ * opening a chat never writes to it.
+ */
+const cardPromptSeen = new Map(); // chatId -> { h, len }
+function checkOtherSummary() {
+    const c = ctx();
+    const st = c.chatId ? state() : null;
+    const ch = currentChar();
+    if (!st || !ch || !settings().enabled || !settings().overviewEnabled) return;
+    if (c.powerUserSettings && c.powerUserSettings.prefer_character_prompt === false) return; // the card's prompt is not sent
+    const p = String(ch.data?.system_prompt ?? '');
+    let h = 5381;
+    for (let i = 0; i < p.length; i++) h = ((h * 33) ^ p.charCodeAt(i)) >>> 0;
+    const seen = cardPromptSeen.get(c.chatId);
+    cardPromptSeen.set(c.chatId, { h, len: p.length });
+    if (!seen || seen.h === h || st.withOther || st.otherAsked) return;
+    if (p.length - seen.len < 200) return;
+    st.otherAsked = true;
+    saveState();
+    toast.info('prompt หลักของการ์ดยาวขึ้นระหว่างแชท อาจมีสรุปจากระบบอื่นเก็บอยู่ในนั้น\nแตะที่นี่ถ้าไม่อยากให้ส่งเรื่องย่อของ Memory Hub ซ้ำ (เปลี่ยนได้ที่ Extensions → Memory Hub)',
+        { timeOut: 20000, onclick: () => setWithOther(true) });
+}
+
 const MOD_FROM_TH = { bot: 'เลือกเอง', tags: 'จากแท็กของการ์ด', default: 'ค่าเริ่มต้น' };
 /** Tooltip text: what it remembers, which bots it suits, which tags switch it on. */
 function moduleTip(m) {
@@ -688,13 +728,16 @@ let lastInjection = null; // what the last generation received (for the preview)
 let autoPausedUntil = 0;  // chat length; auto-summary waits after a failure
 let blockedChunk = null;  // { chatId, start, end }: the chunk a content filter keeps stopping
 
+/** Part of the story for summarizing (sent or not). */
+const isStory = m => !!m && (!m.is_system || (!!settings().summarizeHidden && isHiddenStory(m)));
+
 function transcript(start, end) {
     const { chat } = ctx();
     const max = settings().maxMessageChars;
     const lines = [];
     for (let i = start; i <= end && i < chat.length; i++) {
         const m = chat[i];
-        if (!m || m.is_system) continue;
+        if (!isStory(m)) continue;
         const text = cleanText(m.mes, max);
         if (!text) continue;
         lines.push(`${m.name || (m.is_user ? '{{user}}' : '{{char}}')}: ${text}`);
@@ -744,8 +787,10 @@ async function summarizeOnce(start, end, { replaceId = null, updateOverview = tr
     const parts = [];
     if (withOverview) parts.push(`PREVIOUS OVERVIEW:\n${st.overview.trim() || '(none yet — this is the start of the story)'}`);
     if (prev) parts.push(`PREVIOUS MEMORY (for continuity, do not repeat it):\n${memoryBlock(prev)}`);
-    // the preset route sends the messages as chat turns instead of this transcript
-    const req = { start, end, context: ctx().substituteParams(parts.join('\n\n')) };
+    // the preset route sends the messages as chat turns instead of this transcript;
+    // hidden messages are not chat turns, so a range with any goes the plain way
+    const hasHidden = ctx().chat.slice(start, end + 1).some(m => m?.is_system && isStory(m));
+    const req = hasHidden ? null : { start, end, context: ctx().substituteParams(parts.join('\n\n')) };
     parts.push(`NEW MESSAGES (#${start}–#${end}):\n${body}`);
 
     let system = fill(summaryTemplate(), withOverview);
@@ -1190,7 +1235,7 @@ function coveredRanges(st) {
 /** Summarized-over messages that no memory covers any more (a memory was deleted). */
 function gapsOf(st) {
     const chat = ctx().chat ?? [];
-    const empty = i => { const m = chat[i]; return !m || m.is_system || !cleanText(m.mes); };
+    const empty = i => { const m = chat[i]; return !isStory(m) || !cleanText(m.mes); };
     return findGaps(coveredRanges(st), Math.min(st.lastEnd, chat.length - 1), empty);
 }
 const gapLabel = ([a, b]) => a === b ? `#${a}` : `#${a}–#${b}`;
@@ -1697,17 +1742,19 @@ async function intercept(chat, _contextSize, _abort, type) {
     if (presetCall && type === 'quiet') {
         const { start, end } = presetCall;
         const full = ctx().chat;
-        const keep = new Set();
-        // positions in the prompt chat (system messages are not in it)
-        for (let i = 0, p = 0; i < full.length; i++) {
-            if (full[i].is_system) continue;
-            if (i >= start && i <= end) keep.add(p);
-            p++;
+        const want = full.slice(start, end + 1).filter(m => m && !m.is_system).length;
+        let at = promptIndex(full);
+        if (chat.filter(pm => { const i = at(pm); return i >= start && i <= end; }).length < want) at = positionalIndex(full, chat) ?? at;
+        for (let k = chat.length - 1; k >= 0; k--) {
+            const i = at(chat[k]);
+            if (!(i >= start && i <= end)) chat.splice(k, 1);
         }
-        for (let k = chat.length - 1; k >= 0; k--) if (!keep.has(k)) chat.splice(k, 1);
         return;
     }
     if (!s.enabled) { lastInjection = null; return; }
+    // Another extension's background request (its own summary, a tracker, ...):
+    // let it see the chat as if Memory Hub were not installed.
+    if (type === 'quiet' && !s.foreignQuiet) return;
 
     // A chunk may be summarizing right now: let it land first, so this prompt
     // already benefits from it. Arcs are not worth the wait.
@@ -1723,24 +1770,22 @@ async function intercept(chat, _contextSize, _abort, type) {
     let trimmed = 0;
     const gaps = gapsOf(st);
     if (s.trimSummarized && st.lastEnd >= 0 && st.memories.some(m => m.source === 'auto')) {
-        // positions in the prompt chat (system messages are not in it); messages
-        // whose memory was deleted stay, so nothing is lost until it is redone
+        // messages whose memory was deleted stay, so nothing is lost until it is redone
         const inGap = i => gaps.some(([a, b]) => i >= a && i <= b);
-        const drop = [];
-        for (let i = 0, p = 0; i <= st.lastEnd && i < full.length; i++) {
-            if (full[i].is_system) continue;
-            if (!inGap(i)) drop.push(p);
-            p++;
-        }
+        let at = promptIndex(full);
+        if (!chat.some(pm => at(pm) >= 0)) at = positionalIndex(full, chat) ?? at;
         // always leave the newest keepRaw messages, even if messages were deleted
         // in the middle and the summarized range no longer lines up
         const cap = Math.max(0, chat.length - Math.max(2, s.keepRaw));
-        for (let k = drop.length - 1; k >= 0; k--) if (drop[k] < cap) { chat.splice(drop[k], 1); trimmed++; }
+        for (let k = cap - 1; k >= 0; k--) {
+            const i = at(chat[k]);
+            if (i >= 0 && i <= st.lastEnd && !inGap(i)) { chat.splice(k, 1); trimmed++; }
+        }
     }
 
     // 2. overview
     let overviewText = '';
-    if (s.overviewEnabled && st.overview.trim()) {
+    if (s.overviewEnabled && !st.withOther && st.overview.trim()) {
         overviewText = String(s.overviewTemplate || '{{overview}}').replaceAll('{{overview}}', st.overview.trim());
         place(KEY_OVERVIEW, overviewText, s.overviewPosition, s.overviewDepth);
     }
@@ -1822,6 +1867,7 @@ async function continueInNewChat() {
         lastEnd: -1,
         chain: [...(old.chain ?? []), oldId],
         ...(old.off ? { off: true } : {}),
+        ...(old.withOther ? { withOther: true, otherAsked: true } : {}),
         memories: old.memories.map(m => {
             const { overviewAfter: _drop, ...rest } = m;
             return {
@@ -2113,7 +2159,7 @@ async function buildExport({ withSource = false } = {}) {
         let srcTokens = null;
         let sourceMessages;
         if (m.source === 'auto' && m.end >= 0) {
-            const msgs = c.chat.slice(m.start, m.end + 1).filter(x => x && !x.is_system);
+            const msgs = c.chat.slice(m.start, m.end + 1).filter(isStory);
             srcTokens = await countTokens(msgs.map(x => cleanText(x.mes, s.maxMessageChars)).join('\n'));
             srcTotal += srcTokens;
             memTotal += memTokens;
@@ -2430,6 +2476,12 @@ function renderSettings() {
           </div>
           <label class="checkbox_label" title="ข้อความที่สรุปแล้วจะไม่ถูกส่งซ้ำ ประหยัดที่สุด แชทจริงไม่ถูกลบหรือซ่อน"><input type="checkbox" id="mh_trim"> ไม่ส่งข้อความที่สรุปแล้ว (ประหยัดโทเคนมากที่สุด)</label>
           <label class="checkbox_label"><input type="checkbox" id="mh_overview"> มี "เรื่องย่อจนถึงตอนนี้" หนึ่งก้อน</label>
+          <div id="mh_otherbox" title="ใช้ร่วมกับระบบสรุปอื่นได้ เช่น Summarize ของ SillyTavern, สรุปที่เก็บใน prompt ของการ์ด หรือ lorebook">
+            <b>ใช้ร่วมกับระบบสรุปอื่น</b>
+            <label class="checkbox_label" title="เมื่อแชทนี้มีสรุปภาพรวมจากที่อื่นอยู่แล้ว (เช่น ใน prompt ของการ์ด) จะไม่ส่งเรื่องย่อของ Memory Hub ซ้ำ ความจำที่ดึงตามความเกี่ยวข้องยังส่งตามปกติ และเรื่องย่อยังถูกอัปเดตไว้ เผื่อเปิดกลับ"><input type="checkbox" id="mh_other_chat"> แชทนี้มีสรุปจากที่อื่นแล้ว: ไม่ส่งเรื่องย่อซ้ำ</label>
+            <label class="checkbox_label" title="ข้อความที่ถูกซ่อน (👻 /hide) ไม่ถูกส่งให้โมเดลอยู่แล้ว แต่ยังเป็นเนื้อเรื่อง ถ้าระบบอื่นซ่อนข้อความที่มันสรุปไว้ Memory Hub ก็ยังจำได้ครบ ปิดถ้าคุณซ่อนข้อความที่ไม่อยากให้จำ เช่น OOC"><input type="checkbox" id="mh_sumhidden"> สรุปข้อความที่ถูกซ่อนด้วย</label>
+            <label class="checkbox_label" title="ส่วนขยายอื่นบางตัวเรียกโมเดลเบื้องหลัง (เช่น ตอนสรุปของมันเอง) ปกติ Memory Hub ไม่ยุ่งกับคำขอพวกนั้น ให้มันเห็นแชทเหมือนไม่มี Memory Hub ติ๊กถ้าอยากให้คำขอเบื้องหลังได้ความจำและถูกตัดข้อความที่สรุปแล้วด้วย"><input type="checkbox" id="mh_foreignquiet"> ใส่ความจำในคำขอเบื้องหลังของส่วนขยายอื่นด้วย</label>
+          </div>
           <label class="checkbox_label"><input type="checkbox" id="mh_latest"> ใส่ความจำก้อนล่าสุดเสมอ (ต่อเนื่องกับข้อความดิบ)</label>
           <label class="checkbox_label"><input type="checkbox" id="mh_notify"> แจ้งเตือนเมื่อสร้างความจำใหม่</label>
           <label class="checkbox_label" title="ปุ่มสมองบนแถบด้านบนของแชท: ดูคิวที่กำลังสรุป สรุปถึงข้อความไหนแล้ว และปุ่มสรุปทันที / สรุปแล้วขึ้นแชทใหม่"><input type="checkbox" id="mh_topbar"> ปุ่มบนแถบด้านบนของแชท (ใช้ร่วมกับ Top Info Bar)</label>
@@ -2573,6 +2625,9 @@ function renderSettings() {
     $('#mh_boost').val(String(s.quotaBoost)).on('change', function () { s.quotaBoost = Number(this.value) || 1; saveSettings(); refreshUi(); });
     bindCheck('#mh_trim', 'trimSummarized');
     bindCheck('#mh_overview', 'overviewEnabled');
+    bindCheck('#mh_sumhidden', 'summarizeHidden');
+    bindCheck('#mh_foreignquiet', 'foreignQuiet');
+    $('#mh_other_chat').on('change', function () { setWithOther(this.checked); });
     bindCheck('#mh_latest', 'includeLatest');
     bindCheck('#mh_notify', 'notify');
     bindCheck('#mh_topbar', 'topbar');
@@ -2832,6 +2887,7 @@ function refreshUi() {
     const off = st ? offReason(st) : '';
     if (off) $('#mh_mode_hint').text(`${OFF_TH[off]}: ไม่สรุปเอง ไม่ถาม และไม่เตือน (กด "สรุปตอนนี้" เองได้)`);
     $('#mh_off_chat').prop({ checked: !!st?.off, disabled: !st });
+    $('#mh_other_chat').prop({ checked: !!st?.withOther, disabled: !st });
     $('#mh_off_bot').prop({ checked: !!st && botOff(), disabled: !st });
     $('#mh_off_botname').text(st ? `(${botName()}${currentChar() ? ' · เป็นแท็ก memhub-off บนการ์ด' : ''})` : '');
     $('#mh_chunk').siblings('span').text(s.mode === 'manual' ? 'ข้อความต่อความจำหนึ่งก้อน' : s.mode === 'semi' ? 'ถามทุก ๆ (ข้อความ)' : 'สรุปทุก ๆ (ข้อความ)');
@@ -3494,6 +3550,7 @@ async function onTopbarClick(e) {
     else if (a === 'gapskip') await skipGaps();
     else if (a === 'off-chat') toggleOff('chat', !state()?.off);
     else if (a === 'off-bot') toggleOff('bot', !botOff());
+    else if (a === 'other-chat') setWithOther(!state()?.withOther);
     else if (a === 'resume') { autoPausedUntil = 0; onMessageReceived(null, 'normal'); }
     else if (a === 'mod-del') {
         const id = t.closest('[data-id]')?.dataset.id;
@@ -3604,6 +3661,8 @@ function renderTopbar() {
       <div class="mh_tp_off">ไม่ต้องจำ:
         <label data-mh="off-chat"><input type="checkbox"${st.off ? ' checked' : ''}> แชทนี้</label>
         <label data-mh="off-bot"><input type="checkbox"${botOff() ? ' checked' : ''}> ${isGroup() ? 'กลุ่ม' : 'บอท'}นี้ทุกแชท</label></div>
+      <div class="mh_tp_off" title="แชทนี้มีสรุปภาพรวมจากที่อื่นอยู่แล้ว (เช่น ใน prompt ของการ์ด): ไม่ส่งเรื่องย่อของ Memory Hub ซ้ำ ความจำที่ดึงยังส่งตามปกติ">
+        <label data-mh="other-chat"><input type="checkbox"${st.withOther ? ' checked' : ''}> มีสรุปจากที่อื่นแล้ว: ไม่ส่งเรื่องย่อซ้ำ</label></div>
       ${backlog ? `<div class="mh_bad">⚠ ค้าง ${pending} ข้อความ ถูกส่งเต็มทุกเทิร์น และข้อความเก่าอาจหลุดจาก context ก่อนถูกจำ <a href="#" data-mh="now">สรุปเลย</a></div>` : ''}
       ${jobHtml}
       <div class="mh_tp_btns">
@@ -3758,6 +3817,7 @@ jQuery(() => {
         const { eventSource, eventTypes: E } = ctx();
         eventSource.on(E.MESSAGE_RECEIVED, onMessageReceived);
         eventSource.on(E.MESSAGE_RECEIVED, () => renderTopbar());
+        eventSource.on(E.MESSAGE_RECEIVED, () => setTimeout(checkOtherSummary, 1500));
         eventSource.on(E.MESSAGE_SENT, () => renderTopbar());
         if (E.APP_READY) eventSource.on(E.APP_READY, () => renderTopbar());
         // the Top Info Bar may load after us, or be switched on/off later
@@ -3776,6 +3836,7 @@ jQuery(() => {
             // an old long chat may be offered arcs; let the chat settle first
             const opened = ctx().chatId;
             setTimeout(() => { if (ctx().chatId === opened) maybeArcs(); }, 2500);
+            setTimeout(() => { if (ctx().chatId === opened) checkOtherSummary(); }, 1000);
         });
         console.log(LOG, `v${VERSION} loaded`);
     } catch (e) {
