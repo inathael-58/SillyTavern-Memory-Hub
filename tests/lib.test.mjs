@@ -198,3 +198,56 @@ test('age labels', () => {
     assert.equal(ageTag({ kind: 'memory', index: 8, total: 58, start: 140, end: 159, chatLength: 1060 }), '[Memory 8/58 · #140–#159 · ~900 messages ago]');
     assert.equal(ageTag({ kind: 'arc', index: 2, total: 5, start: -1, end: -1, chatLength: 10, earlier: true }), '[Arc 2/5 · from an earlier chat]');
 });
+
+// ---------------------------------------------------------------- prompt chat vs real chat (living with other extensions)
+
+import { isHiddenStory, positionalIndex, promptIndex } from '../lib.js';
+
+// what ST hands interceptors: copies of the non-system messages, extra shared
+const promptOf = full => full.filter(m => !m.is_system).map((m, index) => ({ ...m, mes: `[regexed] ${m.mes}`, index }));
+const mk = n => Array.from({ length: n }, (_, i) => ({ name: i % 2 ? 'Bot' : 'User', is_user: !(i % 2), mes: `m${i}`, send_date: `d${i}`, extra: {} }));
+
+test('promptIndex finds copies through the shared extra object', () => {
+    const full = mk(6);
+    full[2].is_system = true; // hidden
+    const chat = promptOf(full);
+    const at = promptIndex(full);
+    assert.deepEqual(chat.map(at), [0, 1, 3, 4, 5]);
+});
+
+test('promptIndex survives another interceptor removing or adding messages first', () => {
+    const full = mk(8);
+    const chat = promptOf(full);
+    chat.splice(1, 2); // someone else dropped #1, #2
+    chat.splice(3, 0, { name: 'System', is_user: false, mes: 'injected' }); // and added one
+    const at = promptIndex(full);
+    assert.deepEqual(chat.map(at), [0, 3, 4, -1, 5, 6, 7]);
+    // by position this would have been wrong, so the fallback refuses
+    assert.equal(positionalIndex(full, chat), null);
+});
+
+test('promptIndex falls back to send date + speaker, and refuses ambiguous ones', () => {
+    const full = mk(4);
+    const chat = promptOf(full).map(({ extra: _e, ...m }) => ({ ...m, extra: {} })); // extra replaced by someone
+    full[3].send_date = full[1].send_date; // same date, same speaker → ambiguous
+    const at = promptIndex(full);
+    assert.deepEqual(chat.map(at), [0, -1, 2, -1]);
+});
+
+test('positionalIndex works when the prompt chat is untouched (and after a swipe)', () => {
+    const full = mk(5);
+    full[1].is_system = true;
+    const chat = promptOf(full);
+    assert.deepEqual(chat.map(positionalIndex(full, chat)), [0, 2, 3, 4]);
+    chat.pop();
+    assert.deepEqual(chat.map(positionalIndex(full, chat)), [0, 2, 3]);
+});
+
+test('isHiddenStory: hidden messages yes, ST notices / comments / tool calls no', () => {
+    assert.equal(isHiddenStory({ is_system: true, mes: 'x', extra: {} }), true);
+    assert.equal(isHiddenStory({ is_system: true, mes: 'x' }), true);
+    assert.equal(isHiddenStory({ is_system: false, mes: 'x' }), false);
+    assert.equal(isHiddenStory({ is_system: true, extra: { type: 'comment' } }), false);
+    assert.equal(isHiddenStory({ is_system: true, extra: { isSmallSys: true } }), false);
+    assert.equal(isHiddenStory({ is_system: true, extra: { tool_invocations: [] } }), false);
+});

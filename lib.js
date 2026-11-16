@@ -441,3 +441,51 @@ export function isComplete(raw, { memory = true, overview = false, arc = false }
     if (overview && !/<\/overview>/i.test(t)) return false;
     return true;
 }
+
+// ---------------------------------------------------------------- prompt chat vs real chat
+
+/**
+ * A message hidden with /hide (or by another summary tool) keeps its text but
+ * becomes is_system. ST's own notices, comments and tool calls are is_system too,
+ * and carry extra.type / tool_invocations; those are never story.
+ */
+export const isHiddenStory = m => !!m && !!m.is_system && !m.extra?.type && !m.extra?.isSmallSys && !Array.isArray(m.extra?.tool_invocations);
+
+/**
+ * Finds a prompt message's index in the real chat. ST hands interceptors copies
+ * ({...message}), so the objects differ, but `extra` is still the same object.
+ * Messages without one fall back to send date + speaker when that is unique.
+ * Another extension may have removed or added messages before us: matching by
+ * message instead of by position keeps us from dropping the wrong ones, and a
+ * message we cannot place is left alone (sent, never lost).
+ */
+export function promptIndex(full) {
+    const byExtra = new Map();
+    const byKey = new Map();
+    const keyOf = m => m && m.send_date ? `${m.send_date}|${m.is_user ? 1 : 0}|${m.name ?? ''}` : '';
+    full.forEach((m, i) => {
+        if (m?.extra && typeof m.extra === 'object') byExtra.set(m.extra, byExtra.has(m.extra) ? -1 : i);
+        const k = keyOf(m);
+        if (k) byKey.set(k, byKey.has(k) ? -1 : i);
+    });
+    return pm => {
+        const e = pm?.extra && typeof pm.extra === 'object' ? byExtra.get(pm.extra) : undefined;
+        if (e !== undefined) return e;
+        const k = keyOf(pm);
+        const i = k ? byKey.get(k) : undefined;
+        return i === undefined ? -1 : i;
+    };
+}
+
+/** The old way, by position: right only when nobody else changed the prompt chat. */
+export function positionalIndex(full, chat) {
+    const map = [];
+    for (let i = 0; i < full.length; i++) if (!full[i].is_system) map.push(i);
+    if (map.length !== chat.length && map.length !== chat.length + 1) return null; // +1: a swipe drops the last one
+    // same count is not proof enough: the speakers (and dates, where known) must line up too
+    for (let p = 0; p < chat.length; p++) {
+        const a = full[map[p]], b = chat[p];
+        if (!!a.is_user !== !!b.is_user || (a.send_date && b.send_date && a.send_date !== b.send_date)) return null;
+    }
+    return pm => { const p = chat.indexOf(pm); return p >= 0 && p < map.length ? map[p] : -1; };
+}
