@@ -4,9 +4,9 @@
    (the old fixed colors if it can't run). The top-bar badge sits on ST's bar, which is the
    same UI background the palette reads. */
 :root {
-    --mh-ok-text: var(--mhub-p-ok-text, #3fb950);
-    --mh-bad-text: var(--mhub-p-bad-text, #e5484d);
-    --mh-warn-text: var(--mhub-p-warn-text, #f5a524);
+    --mhub-ok-text: var(--mhub-p-ok-text, #3fb950);
+    --mhub-bad-text: var(--mhub-p-bad-text, #e5484d);
+    --mhub-warn-text: var(--mhub-p-warn-text, #f5a524);
 }
 
 /* error texts (JSON, URLs) have no spaces: let them wrap instead of widening the panel */
@@ -28,10 +28,10 @@
 .memory-hub-settings .mh_warn {
     margin: 0.4em 0;
     padding: 0.4em 0.7em;
-    border-left: 3px solid var(--mh-warn-text);
+    border-left: 3px solid var(--mhub-warn-text);
     font-size: 0.9em;
 }
-.memory-hub-settings .mh_warn i { color: var(--mh-warn-text); }
+.memory-hub-settings .mh_warn i { color: var(--mhub-warn-text); }
 .memory-hub-settings .mh_note { display: block; margin-top: 0.8em; opacity: 0.75; }
 .memory-hub-settings .mh_adv { margin-top: 0.8em; }
 .memory-hub-settings textarea { width: 100%; box-sizing: border-box; font-size: 0.88em; }
@@ -103,8 +103,8 @@
 /* ---------------------------------------------------------------- 1.1 */
 .mh_hidden { display: none !important; }
 .memory-hub-settings .mh_hint { display: block; opacity: 0.75; margin: 0.2em 0 0.4em; }
-.memory-hub-settings .mh_ok { color: var(--mh-ok-text); }
-.memory-hub-settings .mh_bad { color: var(--mh-bad-text); }
+.memory-hub-settings .mh_ok { color: var(--mhub-ok-text); }
+.memory-hub-settings .mh_bad { color: var(--mhub-bad-text); }
 .mh_sources { display: flex; flex-direction: column; gap: 0.3em; margin: 0.3em 0; }
 .mh_src { display: flex; align-items: center; gap: 0.4em; }
 .mh_src select { flex: 1 1 0; width: 0; margin: 0; min-width: 0; }
@@ -181,7 +181,7 @@ body.reduced-motion #mh_topbar_btn.mh_busy { animation: none; }
     font-size: min(calc(var(--mh-badge-em, 1em) * var(--mh-fit, 1) * 0.85), 1em);
     padding: 0.3em 0.4em;
 }
-#mh_topbar_btn .mh_topbadge.mh_bad { border-color: var(--mh-bad-text); color: var(--mh-bad-text); }
+#mh_topbar_btn .mh_topbadge.mh_bad { border-color: var(--mhub-bad-text); color: var(--mhub-bad-text); }
 #mh_ownbar {
     display: flex; align-items: center; gap: 0.5em;
     padding: 2px 10px; font-size: 0.85em;
@@ -205,8 +205,8 @@ body.reduced-motion #mh_topbar_btn.mh_busy { animation: none; }
 #mh_topbar_panel .mh_tp_dim { opacity: 0.7; }
 #mh_topbar_panel .mh_tp_job { margin: 0.3em 0; }
 #mh_topbar_panel .mh_tp_stop { margin-left: 0.5em; }
-#mh_topbar_panel .mh_ok { color: var(--mh-ok-text); }
-#mh_topbar_panel .mh_bad { color: var(--mh-bad-text); }
+#mh_topbar_panel .mh_ok { color: var(--mhub-ok-text); }
+#mh_topbar_panel .mh_bad { color: var(--mhub-bad-text); }
 #mh_topbar_panel a { color: var(--SmartThemeQuoteColor, #e18a24); }
 #mh_topbar_panel .mh_tp_btns { display: flex; flex-wrap: wrap; gap: 0.3em; margin-top: 0.4em; }
 #mh_topbar_panel .mh_tp_btns .menu_button { width: auto; flex: 1 1 auto; margin: 0; padding: 0.3em 0.6em; white-space: nowrap; }
@@ -232,7 +232,7 @@ body.reduced-motion #mh_topbar_btn.mh_busy { animation: none; }
 .mh_iconpick.mh_on { border-color: var(--SmartThemeQuoteColor, #e18a24); box-shadow: 0 0 0 1px var(--SmartThemeQuoteColor, #e18a24); }
 .mh_export { text-align: left; }
 .mh_import .mh_file_btn { margin: 0.2em 0 0.4em; }
-.mh_card .mh_trunc { font-size: 0.8em; color: var(--mh-warn-text); white-space: nowrap; }
+.mh_card .mh_trunc { font-size: 0.8em; color: var(--mhub-warn-text); white-space: nowrap; }
 .mh_card .mh_trunc.mh_soft { color: inherit; opacity: 0.7; }
 
 /* ---------------------------------------------------------------- 1.5 module tips + top bar modules */
@@ -253,7 +253,7 @@ body.reduced-motion #mh_topbar_btn.mh_busy { animation: none; }
 .mh_verline { font-size: 0.9em; opacity: 0.85; margin: 2px 0 6px; }
 .mh_verbtns { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .mh_verbtns .menu_button { width: auto; margin: 0; font-size: 0.95em; }
-.mh_stale { color: var(--mh-warn-text); font-weight: 600; }
+.mh_stale { color: var(--mhub-warn-text); font-weight: 600; }
 
 /* ---------------------------------------------------------------- 1.11 don't remember (per chat / per bot) */
 #mh_topbar_btn.mh_off { opacity: 0.45; }
