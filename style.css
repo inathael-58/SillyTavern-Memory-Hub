@@ -289,3 +289,7 @@ html.mhub-pal :is(#mh_topbar_panel, #mh_ownbar, .mh_manager, .memory-hub-setting
     --SmartThemeUnderlineColor: var(--mhub-p-underline);
     --SmartThemeBorderColor: var(--mhub-p-line);
 }
+
+/* ST's plain .menu_button is display:flex, which drops the space between an icon and its
+   label. Zero-specificity roots, so a gap this extension already sets still wins. */
+:where([class^="mh_"], [class*=" mh_"], [id^="mh_"], .memory-hub-settings) .menu_button { gap: 0.4em; }
