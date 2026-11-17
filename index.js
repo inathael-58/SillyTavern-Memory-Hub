@@ -25,7 +25,7 @@
  * Profiles); when one fails, times out or answers empty, the next is tried.
  */
 
-import { ageTag, arcBounds, blockKind, clampCut, cleanKeys, cleanText, estimateArcs, findGaps, hasSegmenter, isComplete, isHiddenStory, nextChunk, normalizeArcs, parseArc, parseMany, parseSummary, planArcStep, positionalIndex, promptIndex, rankMemories } from './lib.js';
+import { ageTag, arcBounds, blockKind, clampCut, cleanKeys, cleanText, estimateArcs, findGaps, hasSegmenter, isComplete, isHiddenStory, nextChunk, savedBlocks, normalizeArcs, parseArc, parseMany, parseSummary, planArcStep, positionalIndex, promptIndex, rankMemories } from './lib.js';
 import { installThemePalette } from './theme-palette.js';
 import { allModules, BUILTIN_MODULES, buildArcPrompt, buildOverviewRule, buildPrompt, extraWords, modulesFromTags } from './modules.js';
 
@@ -34,7 +34,7 @@ const MODULE = 'memory_hub';
 const PRESET_SRC = 'main-preset';
 const isBuiltinSource = id => id === 'main' || id === PRESET_SRC;
 const LOG = '[MemoryHub]';
-const VERSION = '2.1.2'; // keep in sync with manifest.json
+const VERSION = '2.1.3'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -1721,17 +1721,36 @@ function recallLines(st, picked, arcs) {
     ].join('\n');
 }
 
+// Size of the messages we stopped sending, for the "sent last" view. Counted in
+// blocks of 50 messages, each kept once counted: a new memory only recounts the
+// last block, so a 10,000-message chat costs no more than a short one.
+const savedBlockCache = new Map(); // `${chatId}|${block key}` -> tokens
 let savedCache = { chatId: null, key: '', tokens: 0 };
-/** Rough size of the messages we stopped sending (counted once per summary). */
+const savedKey = (lastEnd, gaps) => `${lastEnd}|${gaps.join(';')}`;
+/** Already known for this summarized range? (no counting) */
+function savedTokensKnown(lastEnd, gaps = []) {
+    const c = ctx();
+    return savedCache.chatId === c.chatId && savedCache.key === savedKey(lastEnd, gaps) ? savedCache.tokens : null;
+}
 async function savedTokens(lastEnd, gaps = []) {
     const c = ctx();
-    const key = `${lastEnd}|${gaps.join(';')}`;
-    if (savedCache.chatId === c.chatId && savedCache.key === key) return savedCache.tokens;
-    const inGap = i => gaps.some(([a, b]) => i >= a && i <= b);
-    const text = c.chat.slice(0, lastEnd + 1).filter((m, i) => !m.is_system && !inGap(i)).map(m => m.mes).join('\n');
-    let tokens;
-    try { tokens = await c.getTokenCountAsync(text); } catch { tokens = Math.ceil(text.length / 3); }
-    savedCache = { chatId: c.chatId, key, tokens };
+    const chatId = c.chatId;
+    const key = savedKey(lastEnd, gaps);
+    const known = savedTokensKnown(lastEnd, gaps);
+    if (known !== null) return known;
+    if (savedBlockCache.size > 2000) savedBlockCache.clear();
+    let tokens = 0;
+    for (const blk of savedBlocks(c.chat, lastEnd, gaps)) {
+        const k = `${chatId}|${blk.key}`;
+        let n = savedBlockCache.get(k);
+        if (n === undefined) {
+            try { n = await c.getTokenCountAsync(blk.text); } catch { n = Math.ceil(blk.text.length / 3); }
+            if (ctx().chatId !== chatId) return 0;
+            savedBlockCache.set(k, n);
+        }
+        tokens += n;
+    }
+    savedCache = { chatId, key, tokens };
     return tokens;
 }
 
@@ -1804,7 +1823,8 @@ async function intercept(chat, _contextSize, _abort, type) {
         at: Date.now(),
         type,
         trimmed,
-        trimmedTokens: trimmed ? await savedTokens(st.lastEnd, gaps) : 0,
+        // counted off the send path: a long chat's first count must not hold up the reply
+        trimmedTokens: trimmed ? savedTokensKnown(st.lastEnd, gaps) : 0,
         overviewText,
         overviewTokens: await countTokens(overviewText),
         recallText,
@@ -1816,6 +1836,10 @@ async function intercept(chat, _contextSize, _abort, type) {
             ...picked.map(m => ({ id: m.id, title: m.title, why: why.get(m.id) ?? [] })),
         ],
     };
+    if (lastInjection.trimmedTokens === null) {
+        const li = lastInjection;
+        savedTokens(st.lastEnd, gaps).then(n => { li.trimmedTokens = n; if (lastInjection === li) refreshUi(); }, () => {});
+    }
     refreshUi();
 }
 globalThis.memoryHub_intercept = intercept;
@@ -2920,7 +2944,7 @@ function refreshUi() {
         if (lastInjection) {
             const nArc = lastInjection.picked.filter(p => p.arc).length;
             status += `<br>ครั้งล่าสุด: ส่งเรื่องย่อ ${lastInjection.overviewTokens} + ${nArc ? `ภาค ${nArc} + ` : ''}ความจำ ${lastInjection.picked.length - nArc} ก้อน ${lastInjection.recallTokens} โทเคน`;
-            if (lastInjection.trimmed) status += ` · ไม่ส่งข้อความเก่า ${lastInjection.trimmed} ข้อความ (ประหยัด ~${lastInjection.trimmedTokens} โทเคน)`;
+            if (lastInjection.trimmed) status += ` · ไม่ส่งข้อความเก่า ${lastInjection.trimmed} ข้อความ (ประหยัด ${lastInjection.trimmedTokens === null ? 'กำลังนับ…' : `~${lastInjection.trimmedTokens}`} โทเคน)`;
         }
         if (lastApi) {
             status += lastApi.ok
@@ -3072,7 +3096,7 @@ async function showLastInjection() {
     const rows = li.picked.map(p => `<li>${p.arc ? '<i class="fa-solid fa-book"></i> ภาค: ' : ''}<b>${esc(p.title)}</b> <small>${esc(p.why.join(' · '))}</small></li>`).join('');
     const html = `<div class="mh_preview">
       <h3>สิ่งที่ Memory Hub ใส่ใน prompt ล่าสุด</h3>
-      <p>ไม่ส่งข้อความที่สรุปแล้ว <b>${li.trimmed}</b> ข้อความ (~${li.trimmedTokens} โทเคน) ·
+      <p>ไม่ส่งข้อความที่สรุปแล้ว <b>${li.trimmed}</b> ข้อความ (${li.trimmedTokens === null ? 'กำลังนับโทเคน…' : `~${li.trimmedTokens} โทเคน`}) ·
          เรื่องย่อ <b>${li.overviewTokens}</b> โทเคน · ความจำที่ดึง <b>${li.recallTokens}</b> โทเคน</p>
       ${rows ? `<h4>ความจำและภาคที่ถูกเลือก (เหตุผล)</h4><ul>${rows}</ul>` : ''}
       ${li.overviewText ? `<h4>เรื่องย่อ</h4><pre>${esc(li.overviewText)}</pre>` : ''}

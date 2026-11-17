@@ -489,3 +489,30 @@ export function positionalIndex(full, chat) {
     }
     return pm => { const p = chat.indexOf(pm); return p >= 0 && p < map.length ? map[p] : -1; };
 }
+
+/**
+ * The summarized messages (up to lastEnd, not system, not in a gap) in fixed
+ * blocks of `size` chat positions, for counting their tokens a block at a time.
+ * A block's key changes when its messages do (count, length, last date), so a
+ * cached count is reused only while the block is the same.
+ */
+export function savedBlocks(chat, lastEnd, gaps = [], size = 50) {
+    const inGap = i => gaps.some(([a, b]) => i >= a && i <= b);
+    const out = [];
+    const end = Math.min(lastEnd, chat.length - 1);
+    for (let start = 0; start <= end; start += size) {
+        const stop = Math.min(end, start + size - 1);
+        const parts = [];
+        let last = '';
+        for (let i = start; i <= stop; i++) {
+            const m = chat[i];
+            if (!m || m.is_system || inGap(i)) continue;
+            parts.push(String(m.mes ?? ''));
+            last = m.send_date ?? last;
+        }
+        if (!parts.length) continue;
+        const text = parts.join('\n');
+        out.push({ key: `${start}-${stop}|${parts.length}|${text.length}|${last}`, text });
+    }
+    return out;
+}
