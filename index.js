@@ -34,7 +34,7 @@ const MODULE = 'memory_hub';
 const PRESET_SRC = 'main-preset';
 const isBuiltinSource = id => id === 'main' || id === PRESET_SRC;
 const LOG = '[MemoryHub]';
-const VERSION = '2.1.0'; // keep in sync with manifest.json
+const VERSION = '2.1.1'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -164,7 +164,7 @@ const SVG_ICONS = {
 const ICONS = [
     'svg:heart', 'svg:star', 'svg:moon',
     'fa-solid fa-bookmark', 'fa-solid fa-book-bookmark', 'fa-solid fa-book-open', 'fa-solid fa-feather', 'fa-solid fa-scroll', 'fa-solid fa-brain',
-    '🔖', '📖', '🌙', '✨', '🌸', '🍀',
+    '🔖', '📖', '🌙', '✨', '🌸', '🍀', // slop-ok: user-picked icons
 ];
 
 /** Inner HTML for an icon choice (Font Awesome class, built-in SVG, or an emoji). */
@@ -703,7 +703,7 @@ async function callModel(system, user, maxTokens, accept = out => !!String(out ?
     if (partial) {
         lastCallPartial = true;
         lastApi = { ok: true, label: `${sourceLabel(order[0])} (คำตอบไม่ครบ)`, at: Date.now() };
-        toast.warn(`ทุก API ตอบไม่จบ ใช้คำตอบที่ได้ไปก่อน ความจำก้อนนี้จะมี ⚠ — ลองเพิ่ม Response length แล้วกด 🔄 สรุปใหม่\n${errors.join(' · ')}`, { timeOut: 15000 });
+        toast.warn(`ทุก API ตอบไม่จบ ใช้คำตอบที่ได้ไปก่อน ความจำก้อนนี้จะมีป้าย “ไม่ครบ” — ลองเพิ่ม Response length แล้วกดปุ่มลูกศรวน (สรุปใหม่)\n${errors.join(' · ')}`, { timeOut: 15000 });
         return partial;
     }
     lastApi = { ok: false, label: sourceLabel(order[0]), error: errors.join(' · '), at: Date.now() };
@@ -894,7 +894,7 @@ async function rescueBlocked(start, end, opt, firstError) {
         if (r.error) continue;
         if (!t.context) {
             contextSuspect = chatId;
-            toast.warn(`ช่วง ${range} ผ่านเมื่อไม่ส่งเรื่องย่อ/ความจำก่อนหน้าไปด้วย — เรื่องย่อหรือความจำก้อนก่อนอาจมีข้อความที่ตัวกรองไม่ชอบ ทำให้ก้อนถัดไปติดต่อกัน\nแตะเพื่อเปิดจัดการความจำ แล้วแก้เรื่องย่อหรือกด 🔄 ที่ความจำก้อนก่อนหน้า`,
+            toast.warn(`ช่วง ${range} ผ่านเมื่อไม่ส่งเรื่องย่อ/ความจำก่อนหน้าไปด้วย — เรื่องย่อหรือความจำก้อนก่อนอาจมีข้อความที่ตัวกรองไม่ชอบ ทำให้ก้อนถัดไปติดต่อกัน\nแตะเพื่อเปิดจัดการความจำ แล้วแก้เรื่องย่อหรือกดปุ่มลูกศรวน (สรุปใหม่)ที่ความจำก้อนก่อนหน้า`,
                 { timeOut: 20000, extendedTimeOut: 10000, onclick: () => openManager() });
         } else {
             gentleRescues++;
@@ -953,7 +953,7 @@ async function rescueBlocked(start, end, opt, firstError) {
     // stopped before anything was written: leave the range for the next run
     if (!last && (cancelRequested || ctx().chatId !== chatId)) throw new Error('หยุดระหว่างแบ่งช่วงที่ติดตัวกรอง');
     if (holes.length) {
-        toast.warn(`ช่วง ${range} ติดตัวกรองเนื้อหา แบ่งสรุปให้แล้ว ${made} ก้อน ข้ามไว้ ${holes.map(h => `#${h.start}–#${h.end}`).join(', ')} (⛔ ความจำว่าง)\nแตะเพื่อเปิดจัดการความจำและเขียนเอง`,
+        toast.warn(`ช่วง ${range} ติดตัวกรองเนื้อหา แบ่งสรุปให้แล้ว ${made} ก้อน ข้ามไว้ ${holes.map(h => `#${h.start}–#${h.end}`).join(', ')} (เป็นความจำว่างที่มีป้าย “ถูกบล็อก”)\nแตะเพื่อเปิดจัดการความจำและเขียนเอง`,
             { timeOut: 20000, extendedTimeOut: 10000, onclick: () => openManager() });
     }
     return last;
@@ -1060,7 +1060,7 @@ async function skipBlocked() {
       <h3>ข้ามช่วง #${b.start}–#${b.end}?</h3>
       <p>จะสร้างความจำว่างแทนช่วงนี้ แล้วสรุปช่วงถัดไปต่อ</p>
       <p>ข้อความช่วงนี้จะไม่ถูกส่งให้บอทอีก (เหมือนช่วงที่สรุปแล้ว) จนกว่าจะเขียนความจำก้อนนี้เอง บอทจะไม่รู้ว่าช่วงนี้เกิดอะไรขึ้น
-      เปิด "จัดการความจำ" เพื่อเขียนเอง หรือกด 🔄 ที่ความจำก้อนนั้นเพื่อลองสรุปใหม่ภายหลัง (เช่น หลังเพิ่ม API สำรอง)</p>`,
+      เปิด "จัดการความจำ" เพื่อเขียนเอง หรือกดปุ่มลูกศรวน (สรุปใหม่)ที่ความจำก้อนนั้นเพื่อลองใหม่ภายหลัง (เช่น หลังเพิ่ม API สำรอง)</p>`,
     c.POPUP_TYPE.CONFIRM, '', { okButton: 'ข้ามช่วงนี้', cancelButton: 'ยังก่อน' });
     if (!ok || busy || currentBlocked() !== b) return;
     const st = state();
@@ -1636,8 +1636,8 @@ async function selectRecall(st, queryText) {
 
     const latest = latestOf(pool);
     const chosen = new Map();
-    for (const m of pool) if (m.pinned) { chosen.set(m.id, m); why.set(m.id, ['📌']); }
-    if (s.includeLatest && latest && !chosen.has(latest.id)) { chosen.set(latest.id, latest); why.set(latest.id, ['🕘 ล่าสุด']); }
+    for (const m of pool) if (m.pinned) { chosen.set(m.id, m); why.set(m.id, ['ปักหมุด']); }
+    if (s.includeLatest && latest && !chosen.has(latest.id)) { chosen.set(latest.id, latest); why.set(latest.id, ['ล่าสุด']); }
 
     // Words shared by every memory (main characters' names) only add a little
     // score each; the floor keeps small talk from pulling in random memories.
@@ -1673,7 +1673,7 @@ async function selectRecall(st, queryText) {
         const plan = arcPlan();
         const live = st.arcs.filter(a => String(a.text ?? '').trim());
         const pickA = new Map();
-        for (const a of live) if (a.pinned) { pickA.set(a.id, a); why.set(a.id, ['📌']); }
+        for (const a of live) if (a.pinned) { pickA.set(a.id, a); why.set(a.id, ['ปักหมุด']); }
         if (s.arcRecall > 0) {
             const ranked = rankMemories(live, queryText);
             const aFloor = Math.max(1, (ranked[0]?.score ?? 0) * 0.35);
@@ -2232,7 +2232,7 @@ function exportMarkdown(x) {
         x.arcs.forEach((a, i) => {
             const where = a.end >= 0 ? `#${a.start}–#${a.end}` : 'จากแชทก่อน';
             const nums = a.members.map(id => title.get(id)).filter(Boolean);
-            lines.push(`### ภาค ${i + 1}. ${a.title || '(ไม่มีชื่อ)'}${a.pinned ? ' 📌' : ''}${a.stale ? ' ⏳ รอสร้างใหม่' : ''}`, '',
+            lines.push(`### ภาค ${i + 1}. ${a.title || '(ไม่มีชื่อ)'}${a.pinned ? ' 📌' : ''}${a.stale ? ' ⏳ รอสร้างใหม่' : ''}`, '', // slop-ok: Markdown export text
                 `_${where} · ${a.members.length} ก้อน${nums.length ? ` (ความจำข้อ ${nums[0]}–${nums.at(-1)})` : ''} · ${a.stats.tokens} โทเคน · จุดตัด: ${{ ai: 'AI เลือก', fixed: 'คงที่', auto: 'ค่ามาตรฐาน' }[a.cutBy] ?? '—'}_  `,
                 `คีย์: ${(a.keys ?? []).join(', ') || '—'}`, '', String(a.text ?? '').trim(), '');
         });
@@ -2241,7 +2241,7 @@ function exportMarkdown(x) {
     x.memories.forEach((m, i) => {
         const where = m.end >= 0 ? `#${m.start}–#${m.end}` : m.source === 'carry' ? 'จากแชทก่อน' : m.source === 'import' ? 'นำเข้า' : 'เพิ่มเอง';
         const st = m.stats.srcTokens ? ` · ต้นฉบับ ${m.stats.srcTokens} → ${m.stats.memTokens} โทเคน (${pct(m.stats.ratio)})` : ` · ${m.stats.memTokens} โทเคน`;
-        lines.push(`### ${i + 1}. ${m.title || '(ไม่มีชื่อ)'}${m.pinned ? ' 📌' : ''}${m.truncated ? ' ⚠ คำตอบถูกตัด' : ''}${m.blocked && !String(m.text ?? '').trim() ? ' ⛔ ถูกบล็อก (ยังไม่ได้เขียน)' : ''}`, '', `_${where}${st}_  `, `คีย์: ${(m.keys ?? []).join(', ') || '—'}`, '', String(m.text ?? '').trim(), '');
+        lines.push(`### ${i + 1}. ${m.title || '(ไม่มีชื่อ)'}${m.pinned ? ' 📌' : ''}${m.truncated ? ' ⚠ คำตอบถูกตัด' : ''}${m.blocked && !String(m.text ?? '').trim() ? ' ⛔ ถูกบล็อก (ยังไม่ได้เขียน)' : ''}`, '', `_${where}${st}_  `, `คีย์: ${(m.keys ?? []).join(', ') || '—'}`, '', String(m.text ?? '').trim(), ''); // slop-ok: Markdown export text
         if (m.sourceMessages?.length) {
             lines.push('<details><summary>ข้อความต้นฉบับ</summary>', '');
             for (const s of m.sourceMessages) lines.push(`> **${s.name}:** ${s.mes.replace(/\n+/g, ' ')}`, '>');
@@ -2401,9 +2401,9 @@ async function restoreDialog(data) {
         const x = chosen();
         const same = x.chat === current;
         const shorter = (x.messages ?? 0) > c.chat.length;
-        const otherBot = data.botKey && botKey() && data.botKey !== botKey() ? '⚠ ไฟล์นี้เป็นของบอท/กลุ่มอื่น ' : '';
+        const otherBot = data.botKey && botKey() && data.botKey !== botKey() ? '<i class="fa-solid fa-triangle-exclamation"></i> ไฟล์นี้เป็นของบอท/กลุ่มอื่น ' : '';
         hint.innerHTML = otherBot + (same
-            ? (shorter ? `⚠ แชทนี้มี ${c.chat.length} ข้อความ น้อยกว่าตอนสำรอง (${x.messages}) ความจำที่เกินจะถูกถอดออก` : 'แชทเดียวกับในไฟล์ — แนะนำ "กู้คืน"')
+            ? (shorter ? `<i class="fa-solid fa-triangle-exclamation"></i> แชทนี้มี ${c.chat.length} ข้อความ น้อยกว่าตอนสำรอง (${x.messages}) ความจำที่เกินจะถูกถอดออก` : 'แชทเดียวกับในไฟล์ — แนะนำ "กู้คืน"')
             : `แชทในไฟล์ไม่ใช่แชทนี้ — แนะนำ "นำมาต่อ"${st.memories.length ? '' : ' (หรือ "กู้คืน" ถ้าแชทนี้คือแชทเดิมที่ถูกเปลี่ยนชื่อ)'}`);
     };
     sel.addEventListener('change', showHint);
@@ -2479,7 +2479,7 @@ function renderSettings() {
           <div id="mh_otherbox" title="ใช้ร่วมกับระบบสรุปอื่นได้ เช่น Summarize ของ SillyTavern, สรุปที่เก็บใน prompt ของการ์ด หรือ lorebook">
             <b>ใช้ร่วมกับระบบสรุปอื่น</b>
             <label class="checkbox_label" title="เมื่อแชทนี้มีสรุปภาพรวมจากที่อื่นอยู่แล้ว (เช่น ใน prompt ของการ์ด) จะไม่ส่งเรื่องย่อของ Memory Hub ซ้ำ ความจำที่ดึงตามความเกี่ยวข้องยังส่งตามปกติ และเรื่องย่อยังถูกอัปเดตไว้ เผื่อเปิดกลับ"><input type="checkbox" id="mh_other_chat"> แชทนี้มีสรุปจากที่อื่นแล้ว: ไม่ส่งเรื่องย่อซ้ำ</label>
-            <label class="checkbox_label" title="ข้อความที่ถูกซ่อน (👻 /hide) ไม่ถูกส่งให้โมเดลอยู่แล้ว แต่ยังเป็นเนื้อเรื่อง ถ้าระบบอื่นซ่อนข้อความที่มันสรุปไว้ Memory Hub ก็ยังจำได้ครบ ปิดถ้าคุณซ่อนข้อความที่ไม่อยากให้จำ เช่น OOC"><input type="checkbox" id="mh_sumhidden"> สรุปข้อความที่ถูกซ่อนด้วย</label>
+            <label class="checkbox_label" title="ข้อความที่ถูกซ่อน (คำสั่ง /hide) ไม่ถูกส่งให้โมเดลอยู่แล้ว แต่ยังเป็นเนื้อเรื่อง ถ้าระบบอื่นซ่อนข้อความที่มันสรุปไว้ Memory Hub ก็ยังจำได้ครบ ปิดถ้าคุณซ่อนข้อความที่ไม่อยากให้จำ เช่น OOC"><input type="checkbox" id="mh_sumhidden"> สรุปข้อความที่ถูกซ่อนด้วย</label>
             <label class="checkbox_label" title="ส่วนขยายอื่นบางตัวเรียกโมเดลเบื้องหลัง (เช่น ตอนสรุปของมันเอง) ปกติ Memory Hub ไม่ยุ่งกับคำขอพวกนั้น ให้มันเห็นแชทเหมือนไม่มี Memory Hub ติ๊กถ้าอยากให้คำขอเบื้องหลังได้ความจำและถูกตัดข้อความที่สรุปแล้วด้วย"><input type="checkbox" id="mh_foreignquiet"> ใส่ความจำในคำขอเบื้องหลังของส่วนขยายอื่นด้วย</label>
           </div>
           <label class="checkbox_label"><input type="checkbox" id="mh_latest"> ใส่ความจำก้อนล่าสุดเสมอ (ต่อเนื่องกับข้อความดิบ)</label>
@@ -2924,8 +2924,8 @@ function refreshUi() {
         }
         if (lastApi) {
             status += lastApi.ok
-                ? `<br><span class="mh_ok">✔ สรุปล่าสุดด้วย ${esc(lastApi.label)}${lastApi.fallback ? ' (สำรอง)' : ''}</span>`
-                : `<br><span class="mh_bad">✖ สรุปล่าสุดล้มเหลว: ${esc(lastApi.error)}</span>`;
+                ? `<br><span class="mh_ok"><i class="fa-solid fa-check"></i> สรุปล่าสุดด้วย ${esc(lastApi.label)}${lastApi.fallback ? ' (สำรอง)' : ''}</span>`
+                : `<br><span class="mh_bad"><i class="fa-solid fa-xmark"></i> สรุปล่าสุดล้มเหลว: ${esc(lastApi.error)}</span>`;
         }
     }
     $('#mh_status').html(status);
@@ -2982,7 +2982,7 @@ function checkRange(from, to) {
         const gaps = gapsOf(st);
         if (gaps.some(([a, b]) => from >= a && to <= b)) return { n: to - from + 1, skip: null, fill: true, words: wordBudget({ size: to - from + 1 }).memory };
         const hint = gaps.length ? ` หรือช่วงที่ไม่มีความจำ: ${gaps.map(gapLabel).join(', ')}` : '';
-        return { error: `ข้อความถึง #${st.lastEnd} สรุปไปแล้ว เริ่มได้ตั้งแต่ #${st.lastEnd + 1}${hint} (ถ้าจะสรุปก้อนเดิมใหม่ ใช้ 🔄 ในคลังความจำ)` };
+        return { error: `ข้อความถึง #${st.lastEnd} สรุปไปแล้ว เริ่มได้ตั้งแต่ #${st.lastEnd + 1}${hint} (ถ้าจะสรุปก้อนเดิมใหม่ ใช้ปุ่มลูกศรวน (สรุปใหม่)ในคลังความจำ)` };
     }
     const skip = from > st.lastEnd + 1 ? [st.lastEnd + 1, from - 1] : null;
     return { n: to - from + 1, skip, words: wordBudget({ size: to - from + 1 }).memory };
@@ -3046,7 +3046,7 @@ async function chooseRangeDialog() {
         const chk = checkRange(parseInt(fromIn.value, 10), parseInt(toIn.value, 10));
         if (chk.error) { info.innerHTML = `<span class="mh_bad">${esc(chk.error)}</span>`; return; }
         const lines = [`${chk.n} ข้อความ → ความจำ 1 ก้อน ยาวไม่เกิน ~${chk.words} คำ`];
-        if (chk.skip) lines.push(`<span class="mh_bad">⚠ ข้อความ #${chk.skip[0]}–#${chk.skip[1]} จะถูกข้าม: ไม่ถูกจำ และไม่ถูกส่งให้บอทอีก</span>`);
+        if (chk.skip) lines.push(`<span class="mh_bad"><i class="fa-solid fa-triangle-exclamation"></i> ข้อความ #${chk.skip[0]}–#${chk.skip[1]} จะถูกข้าม: ไม่ถูกจำ และไม่ถูกส่งให้บอทอีก</span>`);
         if (chk.n > s.chunkSize * 3) lines.push('ช่วงยาวมาก รายละเอียดเล็ก ๆ จะหายมากขึ้น ถ้าอยากละเอียดให้แบ่งเป็นหลายช่วง หรือเพิ่มตัวคูณโควต้าความจำ');
         info.innerHTML = lines.join('<br>');
     };
@@ -3069,7 +3069,7 @@ async function showLastInjection() {
     const li = lastInjection;
     const { Popup, POPUP_TYPE } = ctx();
     if (!li) return toast.info('ยังไม่มีการส่งข้อความตั้งแต่เปิดแชทนี้ ลองส่งหรือ swipe หนึ่งครั้ง');
-    const rows = li.picked.map(p => `<li>${p.arc ? '📚 ภาค: ' : ''}<b>${esc(p.title)}</b> <small>${esc(p.why.join(' · '))}</small></li>`).join('');
+    const rows = li.picked.map(p => `<li>${p.arc ? '<i class="fa-solid fa-book"></i> ภาค: ' : ''}<b>${esc(p.title)}</b> <small>${esc(p.why.join(' · '))}</small></li>`).join('');
     const html = `<div class="mh_preview">
       <h3>สิ่งที่ Memory Hub ใส่ใน prompt ล่าสุด</h3>
       <p>ไม่ส่งข้อความที่สรุปแล้ว <b>${li.trimmed}</b> ข้อความ (~${li.trimmedTokens} โทเคน) ·
@@ -3098,7 +3098,7 @@ function renderManagerHeader() {
     const loose = arcUnits(st).filter(m => !held.has(m.id)).length;
     const arcLine = st.arcs.length ? ` · <b>${st.arcs.length}</b> ภาค (ยังไม่เข้าภาค ${loose} ก้อน)` : '';
     el.innerHTML = `ความจำ <b>${st.memories.length}</b> ก้อน${carried ? ` (จากแชทก่อน ${carried})` : ''}${imported ? ` (นำเข้า ${imported})` : ''}${arcLine} · สรุปแล้วถึง #${st.lastEnd} จาก ${len} ข้อความ${busy ? ' · <i class="fa-solid fa-spinner fa-spin"></i> กำลังทำงาน <a href="#" class="mh_cancel">หยุด</a>' : ''}`
-        + (gaps.length ? `<div class="mh_bad">⚠ ${esc(gapWarning(gaps))} <a href="#" class="mh_gap_fill">สรุปช่วงนี้</a> · <a href="#" class="mh_gap_skip">ไม่ต้องจำ</a></div>` : '');
+        + (gaps.length ? `<div class="mh_bad"><i class="fa-solid fa-triangle-exclamation"></i> ${esc(gapWarning(gaps))} <a href="#" class="mh_gap_fill">สรุปช่วงนี้</a> · <a href="#" class="mh_gap_skip">ไม่ต้องจำ</a></div>` : '');
     el.querySelector('.mh_gap_fill')?.addEventListener('click', async e => { e.preventDefault(); await chooseRangeDialog(); renderManagerList(); renderManagerHeader(); });
     el.querySelector('.mh_gap_skip')?.addEventListener('click', async e => { e.preventDefault(); await skipGaps(); renderManagerHeader(); });
     el.querySelector('.mh_cancel')?.addEventListener('click', e => { e.preventDefault(); cancelRequested = true; toast.info('จะหยุดหลังก้อนนี้เสร็จ'); });
@@ -3112,9 +3112,9 @@ function memoryCard(m, recalled) {
       <div class="mh_card_head">
         <input class="text_pole mh_title" value="${esc(m.title)}" placeholder="ชื่อ">
         <span class="mh_range" title="${esc(m.origin?.chat ?? '')}">${esc(range)}</span>
-        ${m.blocked && !String(m.text ?? '').trim() ? '<span class="mh_trunc" title="ช่วงนี้ถูกตัวกรองเนื้อหาของผู้ให้บริการบล็อก จึงข้ามไว้ — เขียนความจำเองในช่องด้านล่าง หรือกด 🔄 เพื่อลองใหม่">⛔ ถูกบล็อก</span>' : ''}
-        ${m.gentle ? '<span class="mh_trunc mh_soft" title="ช่วงนี้ติดตัวกรองเนื้อหา จึงเขียนฉากแรง/เลิฟซีนแบบไม่ลงรายละเอียด แก้เพิ่มเองได้ในช่องด้านล่าง">🕊 แบบเบา</span>' : ''}
-        ${m.truncated ? '<span class="mh_trunc" title="คำตอบของโมเดลถูกตัดกลางคัน ความจำนี้อาจไม่ครบ — เพิ่ม Response length แล้วกด 🔄">⚠ ไม่ครบ</span>' : ''}
+        ${m.blocked && !String(m.text ?? '').trim() ? '<span class="mh_trunc" title="ช่วงนี้ถูกตัวกรองเนื้อหาของผู้ให้บริการบล็อก จึงข้ามไว้ — เขียนความจำเองในช่องด้านล่าง หรือกดปุ่มลูกศรวน (สรุปใหม่)เพื่อลองใหม่"><i class="fa-solid fa-ban"></i> ถูกบล็อก</span>' : ''}
+        ${m.gentle ? '<span class="mh_trunc mh_soft" title="ช่วงนี้ติดตัวกรองเนื้อหา จึงเขียนฉากแรง/เลิฟซีนแบบไม่ลงรายละเอียด แก้เพิ่มเองได้ในช่องด้านล่าง"><i class="fa-solid fa-dove"></i> แบบเบา</span>' : ''}
+        ${m.truncated ? '<span class="mh_trunc" title="คำตอบของโมเดลถูกตัดกลางคัน ความจำนี้อาจไม่ครบ — เพิ่ม Response length แล้วกดปุ่มลูกศรวน (สรุปใหม่)"><i class="fa-solid fa-triangle-exclamation"></i> ไม่ครบ</span>' : ''}
         <i class="fa-solid fa-thumbtack mh_icon mh_pin" title="ปักหมุด: ใส่ใน prompt ทุกครั้ง"></i>
         ${m.end >= 0 && m.source === 'auto' ? '<i class="fa-solid fa-rotate mh_icon mh_resum" title="สรุปช่วงนี้ใหม่ (เช่น หลังแก้ข้อความ)"></i>' : ''}
         <i class="fa-solid fa-trash mh_icon mh_del" title="ลบ"></i>
@@ -3156,10 +3156,10 @@ function arcCard(st, a, recalled, byId) {
         ${last ? '<i class="fa-solid fa-trash mh_icon mh_arc_del" title="ยุบภาคนี้ (ความจำข้างในยังอยู่ครบ)"></i>' : '<i class="fa-solid fa-object-group mh_icon mh_arc_merge" title="รวมกับภาคถัดไป"></i>'}
       </div>
       <div class="mh_arc_meta">${a.members.length} ก้อน · ${esc(where)}${cut ? ` · ${cut}` : ''}
-        ${a.stale ? ' <span class="mh_trunc" title="ความจำข้างในถูกลบ เพิ่ม หรือสรุปใหม่ ภาคนี้จะถูกเขียนใหม่รอบถัดไป หรือกด 🔄">⏳ รอสร้างใหม่</span>' : ''}
-        ${a.edited ? ' <span class="mh_trunc mh_soft mh_edited" title="มีความจำข้างในที่ถูกแก้เอง ภาคยังเป็นข้อความเดิม กด 🔄 เพื่อเขียนภาคใหม่ หรือแก้ข้อความภาคเอง">✎ ความจำข้างในถูกแก้</span>' : ''}
-        ${a.gentle ? ' <span class="mh_trunc mh_soft">🕊 แบบเบา</span>' : ''}
-        ${a.truncated ? ' <span class="mh_trunc" title="คำตอบของโมเดลถูกตัดกลางคัน ภาคนี้อาจไม่ครบ — เพิ่ม Response length แล้วกด 🔄">⚠ ไม่ครบ</span>' : ''}</div>
+        ${a.stale ? ' <span class="mh_trunc" title="ความจำข้างในถูกลบ เพิ่ม หรือสรุปใหม่ ภาคนี้จะถูกเขียนใหม่รอบถัดไป หรือกดปุ่มลูกศรวน (สรุปใหม่)"><i class="fa-solid fa-hourglass-half"></i> รอสร้างใหม่</span>' : ''}
+        ${a.edited ? ' <span class="mh_trunc mh_soft mh_edited" title="มีความจำข้างในที่ถูกแก้เอง ภาคยังเป็นข้อความเดิม กดปุ่มลูกศรวน (สรุปใหม่)เพื่อเขียนภาคใหม่ หรือแก้ข้อความภาคเอง">✎ ความจำข้างในถูกแก้</span>' : ''}
+        ${a.gentle ? ' <span class="mh_trunc mh_soft"><i class="fa-solid fa-dove"></i> แบบเบา</span>' : ''}
+        ${a.truncated ? ' <span class="mh_trunc" title="คำตอบของโมเดลถูกตัดกลางคัน ภาคนี้อาจไม่ครบ — เพิ่ม Response length แล้วกดปุ่มลูกศรวน (สรุปใหม่)"><i class="fa-solid fa-triangle-exclamation"></i> ไม่ครบ</span>' : ''}</div>
       <textarea class="text_pole mh_keys" rows="1" placeholder="คีย์ (คั่นด้วย , หรือขึ้นบรรทัดใหม่)">${esc((a.keys ?? []).join(', '))}</textarea>
       <textarea class="text_pole mh_text" rows="5">${esc(a.text)}</textarea>
       ${recalled.has(a.id) ? '<small class="mh_tag">ถูกใส่ใน prompt ล่าสุด</small>' : ''}
@@ -3372,7 +3372,7 @@ async function openManager() {
                 if (guardBusy()) return;
                 const ok = await ctx().callGenericPopup(`<h3>ลบความจำ #${m.start}–#${m.end}?</h3>
                   <p>ข้อความช่วงนี้จะกลับไปถูกส่งให้บอทแบบเต็มจนกว่าจะสรุปใหม่ (สรุปช่วงที่เลือก หรือ "สรุปตอนนี้" ถ้าเป็นก้อนล่าสุด)</p>
-                  <p>ถ้าแค่อยากสรุปใหม่หลังแก้ข้อความ กด 🔄 ที่ก้อนนี้แทนได้เลย</p>`,
+                  <p>ถ้าแค่อยากสรุปใหม่หลังแก้ข้อความ กดปุ่มลูกศรวน (สรุปใหม่)ที่ก้อนนี้แทนได้เลย</p>`,
                 ctx().POPUP_TYPE.CONFIRM, '', { okButton: 'ลบ', cancelButton: 'ยกเลิก' });
                 if (!ok) return;
             }
@@ -3640,11 +3640,11 @@ function renderTopbar() {
         jobHtml = '<div class="mh_tp_job mh_tp_dim">ไม่มีงานที่กำลังทำ</div>';
     }
     if (queued) jobHtml += `<div class="mh_tp_dim">รอคิวอีก ${queued} รอบ</div>`;
-    if (lastJob && !busy) jobHtml += `<div class="${lastJob.ok ? 'mh_ok' : 'mh_bad'}">${lastJob.ok ? '✔' : '✖'} ${esc(lastJob.text)} <span class="mh_tp_dim">· ${ago(lastJob.at)}</span></div>`;
+    if (lastJob && !busy) jobHtml += `<div class="${lastJob.ok ? 'mh_ok' : 'mh_bad'}">${lastJob.ok ? '<i class="fa-solid fa-check"></i>' : '<i class="fa-solid fa-xmark"></i>'} ${esc(lastJob.text)} <span class="mh_tp_dim">· ${ago(lastJob.at)}</span></div>`;
     const blocked = !busy && currentBlocked();
     const gaps = gapsOf(st);
-    if (gaps.length) jobHtml += `<div class="mh_bad">⚠ ${esc(gapWarning(gaps))} <a href="#" data-mh="range">สรุปช่วงนี้</a> · <a href="#" data-mh="gapskip">ไม่ต้องจำ</a></div>`;
-    if (blocked) jobHtml += `<div class="mh_bad">⛔ ช่วง #${blocked.start}–#${blocked.end} ถูกตัวกรองเนื้อหาบล็อก สรุปช่วงถัดไปไม่ได้จนกว่าจะผ่านช่วงนี้ <a href="#" data-mh="skip">ข้ามช่วงนี้ (เขียนเอง)</a></div>`;
+    if (gaps.length) jobHtml += `<div class="mh_bad"><i class="fa-solid fa-triangle-exclamation"></i> ${esc(gapWarning(gaps))} <a href="#" data-mh="range">สรุปช่วงนี้</a> · <a href="#" data-mh="gapskip">ไม่ต้องจำ</a></div>`;
+    if (blocked) jobHtml += `<div class="mh_bad"><i class="fa-solid fa-ban"></i> ช่วง #${blocked.start}–#${blocked.end} ถูกตัวกรองเนื้อหาบล็อก สรุปช่วงถัดไปไม่ได้จนกว่าจะผ่านช่วงนี้ <a href="#" data-mh="skip">ข้ามช่วงนี้ (เขียนเอง)</a></div>`;
     const paused = !busy && s.mode !== 'manual' && autoPausedUntil > len;
     const modeLine = !s.enabled ? 'Memory Hub ปิดอยู่'
         : off ? `${OFF_TH[off]}: ไม่สรุปเอง ไม่ถาม ไม่เตือน (กด "สรุปเดี๋ยวนี้" เองได้)`
@@ -3663,7 +3663,7 @@ function renderTopbar() {
         <label data-mh="off-bot"><input type="checkbox"${botOff() ? ' checked' : ''}> ${isGroup() ? 'กลุ่ม' : 'บอท'}นี้ทุกแชท</label></div>
       <div class="mh_tp_off" title="แชทนี้มีสรุปภาพรวมจากที่อื่นอยู่แล้ว (เช่น ใน prompt ของการ์ด): ไม่ส่งเรื่องย่อของ Memory Hub ซ้ำ ความจำที่ดึงยังส่งตามปกติ">
         <label data-mh="other-chat"><input type="checkbox"${st.withOther ? ' checked' : ''}> มีสรุปจากที่อื่นแล้ว: ไม่ส่งเรื่องย่อซ้ำ</label></div>
-      ${backlog ? `<div class="mh_bad">⚠ ค้าง ${pending} ข้อความ ถูกส่งเต็มทุกเทิร์น และข้อความเก่าอาจหลุดจาก context ก่อนถูกจำ <a href="#" data-mh="now">สรุปเลย</a></div>` : ''}
+      ${backlog ? `<div class="mh_bad"><i class="fa-solid fa-triangle-exclamation"></i> ค้าง ${pending} ข้อความ ถูกส่งเต็มทุกเทิร์น และข้อความเก่าอาจหลุดจาก context ก่อนถูกจำ <a href="#" data-mh="now">สรุปเลย</a></div>` : ''}
       ${jobHtml}
       <div class="mh_tp_btns">
         <div class="menu_button${busy ? ' disabled' : ''}" data-mh="now"><i class="fa-solid fa-wand-magic-sparkles"></i> สรุปเดี๋ยวนี้</div>
@@ -3808,7 +3808,7 @@ function watchVersion() {
 
 jQuery(() => {
     // สีที่อ่านออกเสมอ: แผงข้อมูลทึบ สีเน้นตัดกับพื้นจริง (ดู theme-palette.js)
-    try { installThemePalette({ prefix: 'mhub' }); } catch (err) { console.warn('[Memory Hub] theme palette', err); }
+    try { installThemePalette({ prefix: 'mhub', colors: { 'ok-text': '#3fb950', 'bad-text': '#e5484d', 'warn-text': '#f5a524' } }); } catch (err) { console.warn('[Memory Hub] theme palette', err); }
     try {
         settings();
         renderSettings();
