@@ -251,3 +251,36 @@ test('isHiddenStory: hidden messages yes, ST notices / comments / tool calls no'
     assert.equal(isHiddenStory({ is_system: true, extra: { isSmallSys: true } }), false);
     assert.equal(isHiddenStory({ is_system: true, extra: { tool_invocations: [] } }), false);
 });
+
+// ---------------------------------------------------------------- savedBlocks: counting a long chat a block at a time
+
+import { savedBlocks } from '../lib.js';
+
+test('savedBlocks splits the summarized messages into fixed blocks, skipping system and gaps', () => {
+    const chat = Array.from({ length: 130 }, (_, i) => ({ mes: `m${i}`, send_date: `d${i}`, is_system: i === 3 }));
+    const blocks = savedBlocks(chat, 119, [[60, 64]], 50);
+    assert.equal(blocks.length, 3);
+    assert.equal(blocks[0].text.split('\n').length, 49); // #3 is system
+    assert.equal(blocks[1].text.split('\n').length, 45); // #60–#64 are a gap
+    assert.equal(blocks[2].text.split('\n').length, 20); // #100–#119
+    assert.ok(!blocks[1].text.includes('m60'));
+});
+
+test('savedBlocks: a new memory only changes the last block', () => {
+    const chat = Array.from({ length: 200 }, (_, i) => ({ mes: `m${i}`, send_date: `d${i}` }));
+    const a = savedBlocks(chat, 119).map(b => b.key);
+    const b = savedBlocks(chat, 139).map(b => b.key);
+    assert.deepEqual(b.slice(0, 2), a.slice(0, 2));
+    assert.notEqual(b[2], a[2]);
+    chat[10].mes = 'edited and longer';
+    assert.notEqual(savedBlocks(chat, 139)[0].key, b[0]);
+    assert.equal(savedBlocks(chat, 139)[1].key, b[1]);
+});
+
+test('savedBlocks: 10,000 messages are quick to split', () => {
+    const chat = Array.from({ length: 10000 }, (_, i) => ({ mes: 'ข้อความยาว ๆ '.repeat(80) + i, send_date: `d${i}` }));
+    const t = performance.now();
+    const blocks = savedBlocks(chat, 9979, [[500, 519]]);
+    assert.equal(blocks.length, 200);
+    assert.ok(performance.now() - t < 1000);
+});
