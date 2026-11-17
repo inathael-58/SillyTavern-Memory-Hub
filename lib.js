@@ -232,7 +232,7 @@ export function rankMemories(memories, queryText, { k1 = 1.2, b = 0.75 } = {}) {
             if (qLower.includes(kl)) {
                 // rarer keys weigh more: a key present in every memory is a name, not a clue
                 score += 1.5 * Math.log(1 + N / (keyDf.get(kl) || 1));
-                hits.push(`🔑${key}`);
+                hits.push(`คีย์ ${key}`);
             }
         }
         return { memory: m, score, hits };
