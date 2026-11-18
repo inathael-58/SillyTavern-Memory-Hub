@@ -34,7 +34,7 @@ const MODULE = 'memory_hub';
 const PRESET_SRC = 'main-preset';
 const isBuiltinSource = id => id === 'main' || id === PRESET_SRC;
 const LOG = '[MemoryHub]';
-const VERSION = '2.1.3'; // keep in sync with manifest.json
+const VERSION = '2.1.4'; // keep in sync with manifest.json
 const KEY_OVERVIEW = 'memory_hub_overview';
 const KEY_RECALL = 'memory_hub_recall';
 
@@ -3209,14 +3209,23 @@ function renderManagerList() {
         html = arcs.map(a => arcCard(st, a, recalled, byId)).join('') + mems.map(m => memoryCard(m, recalled.has(m.id))).join('');
         if (!html) html = '<div class="mh_empty">ไม่พบ</div>';
     } else {
+        // pinned and hand-written memories stay on top: new chunks would push them down the list
+        const mine = m => m.pinned || m.source === 'manual';
+        const top = [...st.memories].reverse().filter(mine);
+        const topArcs = [...st.arcs].reverse().filter(a => a.pinned);
+        if (top.length || topArcs.length) {
+            html += `<div class="mh_sub_head">ปักหมุด / เพิ่มเอง (${top.length + topArcs.length}) <small>อยู่บนสุดเสมอ</small></div>`;
+            html += topArcs.map(a => arcCard(st, a, recalled, byId)).join('') + top.map(m => memoryCard(m, recalled.has(m.id))).join('');
+        }
         const held = new Set(st.arcs.flatMap(a => a.members));
-        const loose = [...st.memories].reverse().filter(m => !held.has(m.id));
-        if (st.arcs.length && loose.length) html += `<div class="mh_sub_head">ยังไม่เข้าภาค (${loose.length})</div>`;
+        const loose = [...st.memories].reverse().filter(m => !held.has(m.id) && !mine(m));
+        if ((st.arcs.length || top.length || topArcs.length) && loose.length) html += `<div class="mh_sub_head">${st.arcs.length ? 'ยังไม่เข้าภาค' : 'ความจำ'} (${loose.length})</div>`;
         html += loose.slice(0, managerShown).map(m => memoryCard(m, recalled.has(m.id))).join('');
         if (loose.length > managerShown) html += `<div class="menu_button mh_more">แสดงเพิ่มอีก ${Math.min(PAGE, loose.length - managerShown)} (เหลือ ${loose.length - managerShown})</div>`;
-        if (st.arcs.length) {
-            html += `<div class="mh_sub_head">ภาค (${st.arcs.length}) <small>ความจำที่รวมเป็นภาคแล้ว ใหม่สุดอยู่บน</small></div>`;
-            html += [...st.arcs].reverse().map(a => arcCard(st, a, recalled, byId)).join('');
+        const restArcs = st.arcs.filter(a => !a.pinned).length;
+        if (restArcs) {
+            html += `<div class="mh_sub_head">ภาค (${restArcs}) <small>ความจำที่รวมเป็นภาคแล้ว ใหม่สุดอยู่บน</small></div>`;
+            html += [...st.arcs].reverse().filter(a => !a.pinned).map(a => arcCard(st, a, recalled, byId)).join('');
         }
         if (!html) html = '<div class="mh_empty">ยังไม่มีความจำ กด "สรุปตอนนี้" หรือคุยต่อไปจนครบรอบ</div>';
     }
